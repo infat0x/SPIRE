@@ -112,8 +112,4 @@ Responses are rejected if the `Content-Type` header contains `text/html` (custom
 | Deprecated endpoints | INFO |
 | Unexpected HTTP verb acceptance (live) | MEDIUM |
 
----
 
-## License
-
-MIT
