@@ -280,7 +280,7 @@ DNSEOF
 
   # ── Step 3: httpx — extended API ports ─────────────────────
   printf "  [3/4] httpx — extended API ports...\n"
-  EXTENDED_PORTS="8080,8443,8000,8888,8008,3000,3001,3003,4000,5000,5001,9000,9001,9090,4443,7443,10000"
+  EXTENDED_PORTS="8080,8443,8000"
   httpx -l "$DNS_RESOLVED" \
     -ports "$EXTENDED_PORTS" \
     -o "$LIVE_EXT" \
