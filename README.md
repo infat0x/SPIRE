@@ -63,7 +63,7 @@ chmod +x spire.sh
 | # | Phase | Description |
 |---|-------|-------------|
 | 1 | Input detection | Parses JSON, plain list, URL list, or single target |
-| 2 | Host probing | Confirms live hosts via `httpx` |
+| 2 | Host probing | DNS pre-filter (dnsx / socket), httpx on ports 80+443, httpx on extended API ports, curl parallel fallback for anything missed |
 | 3 | Wordlist | Builds 60-path swagger/openapi wordlist |
 | 4 | Fuzzing | Runs `ffuf` across all live hosts × all paths |
 | 5 | FP filtering | Validates hits via Content-Type header and JSON structure |
@@ -112,4 +112,8 @@ Responses are rejected if the `Content-Type` header contains `text/html` (custom
 | Deprecated endpoints | INFO |
 | Unexpected HTTP verb acceptance (live) | MEDIUM |
 
+---
 
+## License
+
+MIT
