@@ -1,0 +1,22 @@
+[
+  {
+    "domain": "example.az",
+    "subdomains": [
+      "sub1.example.az",
+      "sub2.example.az",
+      "test.example.az"
+    ]
+  },
+  {
+    "domain": "example2.az",
+    "subdomains": [
+      "app.example2.az",
+      "api.example2.az",
+      "www.example2.az"
+    ]
+  },
+  {
+    "domain": "example3.com",
+    "subdomains": []
+  }
+]
