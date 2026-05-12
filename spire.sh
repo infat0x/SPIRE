@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ============================================================
-#  SPIRE - Spec Path Inspector & Recon Engine  v2.2
+#  SPIRE - Spec Path Inspector & Recon Engine  v1.0
 #
 #  Input (any one of):
 #    ./spire.sh domains.json          # JSON with domain/subdomains
