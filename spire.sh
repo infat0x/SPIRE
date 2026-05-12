@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ============================================================
-#  SPIRE - Spec Path Inspector & Recon Engine  v1.0
+#  SPIRE - Spec Path Inspector & Recon Engine  v2.2
 #
 #  Input (any one of):
 #    ./spire.sh domains.json          # JSON with domain/subdomains
@@ -145,7 +145,7 @@ printf "  Started      : %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
 printf "${D}%s${N}\n" "$SEP"
 
 # ============================================================
-# PHASE 1 - Parse input
+# PHASE 1 – Parse input
 # ============================================================
 phase_header 1 "Detecting and loading input"
 
@@ -180,7 +180,7 @@ TOTAL=$(wc -l < "$TARGETS" | tr -d ' ')
 printf "  Unique targets loaded  : %s\n" "$TOTAL"
 
 # ============================================================
-# PHASE 2 - Probe live hosts
+# PHASE 2 – Probe live hosts
 # ============================================================
 phase_header 2 "Probing live hosts"
 
@@ -205,7 +205,7 @@ else
 fi
 
 # ============================================================
-# PHASE 3 - Wordlist
+# PHASE 3 – Wordlist
 # ============================================================
 phase_header 3 "Building API path wordlist"
 
@@ -287,7 +287,7 @@ PATH_COUNT=$(wc -l < "$WORDLIST" | tr -d ' ')
 printf "  ${G}[+]${N} %s paths loaded\n" "$PATH_COUNT"
 
 # ============================================================
-# PHASE 4 - ffuf
+# PHASE 4 – ffuf
 # ============================================================
 phase_header 4 "Fuzzing with ffuf"
 start_spinner "Scanning $LIVE_COUNT hosts x $PATH_COUNT paths..."
@@ -311,9 +311,23 @@ except: print(0)
 stop_spinner "ffuf complete  ($RAW_HITS raw hits)"
 
 # ============================================================
-# PHASE 5 - False positive filter  [v2.2: threading + strict validation]
+# PHASE 5 – False positive filter  [v2.2: threading + strict validation]
 # ============================================================
 phase_header 5 "Filtering false positives"
+
+# ── What changed in v2.2 ──────────────────────────────────────
+# OLD: sequential curl calls + loose keyword grep in HTML body
+#      → custom 404 pages that contain words like "swagger" or "version"
+#        were accepted as real findings (false positives)
+#
+# NEW: ThreadPoolExecutor (parallel) + two-gate validation:
+#   Gate 1 – Content-Type header must contain json/yaml/openapi/octet-stream
+#             A custom 404 page sends text/html → rejected immediately
+#   Gate 2 – JSON/YAML parse with top-level key check:
+#             body must be valid JSON with both ("openapi"|"swagger") AND "paths"
+#             OR valid YAML with the same keys
+#             A JSON error page or bare HTML never passes this gate
+# ─────────────────────────────────────────────────────────────
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
 import json, subprocess, os, sys
@@ -330,14 +344,23 @@ except Exception as e:
     print(f"  [!] Cannot parse ffuf output: {e}")
     sys.exit(0)
 
+# ── Gate helpers ─────────────────────────────────────────────
 def content_type_ok(ct: str) -> bool:
+    """True when Content-Type looks like a machine-readable spec, not HTML."""
     ct = ct.lower()
     return any(tok in ct for tok in (
         "json", "yaml", "openapi", "octet-stream", "x-yaml", "text/plain"
     )) and "html" not in ct
 
 def body_is_spec(raw: bytes) -> bool:
+    """
+    True when the response body is a real OpenAPI/Swagger document.
+    Tries JSON first, then falls back to a lightweight YAML key-scan
+    (avoids a heavy PyYAML import that may not be available).
+    """
     text = raw.decode("utf-8", errors="ignore")
+
+    # ── JSON gate ────────────────────────────────────────────
     try:
         doc = json.loads(text)
         if not isinstance(doc, dict):
@@ -347,17 +370,23 @@ def body_is_spec(raw: bytes) -> bool:
         return has_version and has_paths
     except json.JSONDecodeError:
         pass
+
+    # ── Lightweight YAML key-scan (no import needed) ─────────
+    # Real YAML specs always have top-level "openapi:" / "swagger:"
+    # AND "paths:" — we look for them without a full parser.
     lines = text[:4000].splitlines()
     top_keys = set()
     for line in lines:
         stripped = line.lstrip()
         if stripped and not stripped.startswith("#"):
+            # top-level key = line with no leading spaces and a colon
             if line and line[0] not in (" ", "\t") and ":" in line:
                 top_keys.add(line.split(":")[0].strip().lower())
     has_version = "openapi" in top_keys or "swagger" in top_keys
     has_paths   = "paths" in top_keys
     return has_version and has_paths
 
+# ── Per-URL worker ────────────────────────────────────────────
 def check_url(item):
     url  = item.get("url", "")
     size = item.get("length", 0)
@@ -369,13 +398,14 @@ def check_url(item):
     try:
         r = subprocess.run(
             ["curl", "-sk", url, "--max-time", str(timeout),
-             "-D", "-",
+             "-D", "-",          # include response headers in stdout
              "--compressed"],
             capture_output=True, timeout=timeout + 5
         )
     except Exception:
         return None
 
+    # Split headers from body
     raw = r.stdout
     sep = b"\r\n\r\n"
     idx = raw.find(sep)
@@ -390,6 +420,7 @@ def check_url(item):
         header_block = ""
         body         = raw
 
+    # Gate 1: Content-Type
     ct = ""
     for line in header_block.splitlines():
         if line.lower().startswith("content-type:"):
@@ -397,13 +428,15 @@ def check_url(item):
             break
 
     if ct and not content_type_ok(ct):
-        return None
+        return None   # text/html custom 404 → reject
 
+    # Gate 2: body must parse as a real spec
     if not body_is_spec(body):
         return None
 
     return {"host": host, "url": url, "size": size}
 
+# ── Baseline sizes (to catch catch-all 200s) ─────────────────
 hosts_items = {}
 for r in results:
     host = r.get("host") or r.get("url","").split("/")[2]
@@ -420,11 +453,13 @@ def get_baseline(host):
     except Exception:
         return -1
 
+# Fetch baselines in parallel
 with ThreadPoolExecutor(max_workers=min(workers, len(hosts_items) or 1)) as ex:
     futs = {ex.submit(get_baseline, h): h for h in hosts_items}
     for f in as_completed(futs):
         baseline_sizes[futs[f]] = f.result()
 
+# Filter out items whose size matches the catch-all baseline
 flat_items = []
 for host, items in hosts_items.items():
     bl = baseline_sizes.get(host, -1)
@@ -432,6 +467,7 @@ for host, items in hosts_items.items():
         if item.get("length", 0) != bl:
             flat_items.append(item)
 
+# ── Parallel validation ───────────────────────────────────────
 total        = len(flat_items)
 done_count   = 0
 real_findings = []
@@ -464,12 +500,19 @@ PYEOF
 FOUND_COUNT=$(wc -l < "$REAL_SWAGGERS" | tr -d ' ')
 
 # ============================================================
-# PHASE 6 - Download specs  [v2.2: parallel downloads]
+# PHASE 6 – Download specs  [v2.2: parallel downloads]
 # ============================================================
 phase_header 6 "Downloading API specs"
 
+# ── What changed in v2.2 ──────────────────────────────────────
+# OLD: sequential shell while-loop — one curl at a time
+# NEW: ThreadPoolExecutor in Python — all URLs fetched in parallel
+#      Same swagger-initializer.js resolution + sibling path probing,
+#      but done concurrently across all confirmed swagger URLs.
+# ─────────────────────────────────────────────────────────────
+
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, os, subprocess, re
+import json, os, subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 out_dir   = os.environ.get("SPIRE_OUT", "./spire-results")
@@ -483,6 +526,7 @@ except:
     swagger_urls = []
 
 def safe_name(url):
+    import re
     return re.sub(r'[/:?=&]', '_', url)
 
 def curl_get(url, max_time=None):
@@ -510,8 +554,10 @@ def process_url(url):
     saved = []
     host = url.split("/")[2] if "/" in url else url
 
+    # 1. Check swagger-initializer.js for configUrl
     init_url    = url.rsplit("/", 1)[0] + "/swagger-initializer.js"
     init_body   = curl_get(init_url).decode("utf-8", errors="ignore")
+    import re
     m = re.search(r'"configUrl"\s*:\s*"([^"]+)"', init_body)
     if m:
         config_url = m.group(1)
@@ -536,11 +582,13 @@ def process_url(url):
         except Exception:
             pass
 
+    # 2. Download the URL itself if it's a spec
     content = curl_get(url, max_time=15)
     if is_spec(content):
         save_spec(content, safe_name(url))
         saved.append(url)
 
+    # 3. Probe common sibling spec paths
     for path in ("/v3/api-docs", "/v2/api-docs", "/openapi.json", "/swagger.json"):
         sib = curl_get(f"https://{host}{path}")
         if is_spec(sib):
@@ -574,13 +622,12 @@ SPEC_COUNT=$(find "$SPECS_DIR" -name '*.json' -size +50c 2>/dev/null | wc -l | t
 printf "  ${G}[+]${N} %s spec files saved\n" "$SPEC_COUNT"
 
 # ============================================================
-# PHASE 7 - Static analysis
+# PHASE 7 – Static analysis
 # ============================================================
 phase_header 7 "Parsing endpoints and analyzing spec security"
 
 SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
-import json, os, glob, sys, re
-from urllib.parse import urlparse
+import json, os, glob, sys
 
 out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
 specs_dir = f"{out_dir}/specs"
@@ -599,33 +646,6 @@ spec_files    = sorted(glob.glob(f"{specs_dir}/*.json"))
 total         = len(spec_files)
 all_endpoints = []
 vulns         = []
-
-def domain_from_spec(base_paths, spec_file):
-    """Return the best domain label for an endpoint."""
-    for bp in base_paths:
-        parsed = urlparse(bp)
-        if parsed.netloc:
-            return parsed.netloc
-    # Fallback: derive from the spec filename which encodes the source URL.
-    # safe_name() replaces [/:?=&] with '_', so the filename looks like:
-    #   https___api_example_com_swagger_json.json
-    # Strip the outer .json extension, drop the scheme prefix, then take
-    # everything up to the first path separator '_'.
-    fname = os.path.basename(spec_file).removesuffix(".json")
-    # Remove scheme (https___ or http___)
-    fname = re.sub(r'^https?___', '', fname)
-    # The domain portion is everything before the first lone '_' that
-    # represents a path slash; real dots were not replaced, so we can
-    # split on '_' and reassemble until we hit something that looks like
-    # a path segment rather than a domain label.
-    parts = fname.split("_")
-    domain_parts = []
-    for p in parts:
-        domain_parts.append(p)
-        # Stop once we've consumed a part that contains a dot (TLD reached)
-        if "." in p:
-            break
-    return "_".join(domain_parts) if domain_parts else fname[:40]
 
 for idx, spec_file in enumerate(spec_files, 1):
     filled = idx * 40 // max(total, 1)
@@ -646,9 +666,6 @@ for idx, spec_file in enumerate(spec_files, 1):
     elif "host" in data:
         schemes = data.get("schemes",["https"])
         base_paths.append(f"{schemes[0]}://{data['host']}{data.get('basePath','')}")
-
-    # Resolve domain once per spec file
-    domain = domain_from_spec(base_paths, spec_file)
 
     paths       = data.get("paths",{})
     global_sec  = data.get("security",[])
@@ -680,15 +697,9 @@ for idx, spec_file in enumerate(spec_files, 1):
             op_sec     = op.get("security",None)
             deprecated = op.get("deprecated",False)
 
-            all_endpoints.append({
-                "method":     mu,
-                "path":       path,
-                "summary":    summary,
-                "api":        title,
-                "deprecated": deprecated,
-                "base":       base_paths[0] if base_paths else "",
-                "domain":     domain,
-            })
+            all_endpoints.append({"method":mu,"path":path,"summary":summary,
+                                   "api":title,"deprecated":deprecated,
+                                   "base":base_paths[0] if base_paths else ""})
 
             has_auth = bool(op_sec) if op_sec is not None else bool(global_sec)
             if not has_auth and mu in ["GET","POST","DELETE"]:
@@ -732,12 +743,17 @@ for idx, spec_file in enumerate(spec_files, 1):
 
 print()
 
+import re as _re
+def _host(base):
+    h = _re.sub(r'^https?://', '', base or "")
+    return h.split("/")[0] or "unknown"
+
 with open(ep_file,"w") as f:
-    f.write(f"Total: {len(all_endpoints)} endpoints\n" + "-"*80 + "\n")
+    f.write(f"Total: {len(all_endpoints)} endpoints\n" + "-"*60 + "\n")
     for ep in all_endpoints:
-        dep    = "  [DEPRECATED]" if ep["deprecated"] else ""
-        domain = ep.get("domain","")
-        f.write(f"  [{ep['method']:6}]  {domain:<35}  {ep['path']}{dep}  ({ep['api']})\n")
+        dep  = "  [DEPRECATED]" if ep["deprecated"] else ""
+        host = _host(ep.get("base",""))
+        f.write(f"  [{ep['method']:6}]  {host:<40}  {ep['path']}{dep}\n")
 
 with open(vuln_file,"w") as f:
     json.dump(vulns, f, indent=2)
@@ -751,9 +767,16 @@ for s in ["HIGH","MEDIUM","LOW","INFO"]:
 PYEOF
 
 # ============================================================
-# PHASE 8 - Live authentication and verb tampering  [v2.2: parallel]
+# PHASE 8 – Live auth + verb tampering  [v2.2: parallel]
 # ============================================================
 phase_header 8 "Live authentication and verb tampering"
+
+# ── What changed in v2.2 ──────────────────────────────────────
+# OLD: sequential curl calls inside a Python for-loop
+# NEW: ThreadPoolExecutor — all auth probes and verb-tamper checks
+#      run in parallel, dramatically reducing wall-clock time for
+#      large swagger-URL lists.
+# ─────────────────────────────────────────────────────────────
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
 import json, subprocess, os
@@ -781,6 +804,7 @@ def probe_code(method, url):
     except:
         return "ERR"
 
+# ── Parallel auth probes ───────────────────────────────────────
 total      = len(swagger_urls)
 done_count = 0
 live_results = []
@@ -802,6 +826,7 @@ with ThreadPoolExecutor(max_workers=workers) as ex:
 
 print()
 
+# ── Parallel verb tampering (first 20 URLs) ───────────────────
 print(f"\n  Verb tampering (first 20 endpoints, parallel)...")
 VERB_METHODS = ["POST","PUT","DELETE","PATCH","OPTIONS"]
 tamper_targets = [(m, url) for url in swagger_urls[:20] for m in VERB_METHODS]
@@ -840,7 +865,7 @@ print(f"  Protected (401/403)    : {p}")
 PYEOF
 
 # ============================================================
-# PHASE 9 - Sensitive data in specs
+# PHASE 9 – Sensitive data in specs
 # ============================================================
 phase_header 9 "Scanning specs for sensitive data exposure"
 
@@ -902,7 +927,7 @@ print(f"  Sensitive data matches : {found}")
 PYEOF
 
 # ============================================================
-# PHASE 10 - Report
+# PHASE 10 – Report
 # ============================================================
 phase_header 10 "Generating report"
 
@@ -1009,8 +1034,6 @@ for line in auth_lines[2:]:
 L.append("\n---\n")
 L.append("## All Parsed Endpoints\n")
 L.append("```")
-L.append(f"  {'METHOD':<8}  {'DOMAIN':<35}  PATH  (API Title)")
-L.append(f"  {'-'*8}  {'-'*35}  {'-'*40}")
 for l in ep_lines[:500]: L.append(l.rstrip())
 if total_ep > 500: L.append(f"... ({total_ep - 500} more -- see all-endpoints.txt)")
 L.append("```")
@@ -1040,7 +1063,7 @@ L.append("|------|-------------|")
 for fn, desc in [
     ("real-swaggers.txt",  "Confirmed swagger/openapi URLs"),
     ("specs/",             "Downloaded API specification files"),
-    ("all-endpoints.txt",  "All parsed endpoints with method, domain, and path"),
+    ("all-endpoints.txt",  "All parsed endpoints with method and path"),
     ("auth-test.txt",      "Live HTTP response codes per swagger URL"),
     ("vuln-findings.txt",  "Raw vulnerability data (JSON)"),
     ("findings.json",      "Machine-readable summary"),
