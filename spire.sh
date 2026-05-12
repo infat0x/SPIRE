@@ -180,7 +180,16 @@ TOTAL=$(wc -l < "$TARGETS" | tr -d ' ')
 printf "  Unique targets loaded  : %s\n" "$TOTAL"
 
 # ============================================================
-# PHASE 2 – Probe live hosts
+# PHASE 2 – Probe live hosts (multi-step)
+# ============================================================
+#
+#  Step 1  DNS pre-filter   — drop NX domains before any HTTP probe
+#                             (dnsx → dig → python3 socket, first available)
+#  Step 2  httpx pass 1     — ports 80, 443  (standard)
+#  Step 3  httpx pass 2     — extended API ports
+#  Step 4  curl fallback    — parallel Python probe for anything still missed
+#  Step 5  merge            — deduplicate all results into live-clean.txt
+#
 # ============================================================
 phase_header 2 "Probing live hosts"
 
@@ -189,19 +198,207 @@ if [ "$IS_LIVE" = "1" ]; then
   printf "  ${G}[+]${N} Skipped -- input is already a probed URL list\n"
   printf "  Live hosts available   : %s\n" "$LIVE_COUNT"
 else
-  start_spinner "Running httpx on $TOTAL hosts..."
-  httpx -l "$TARGETS" \
-    -o "$LIVE" \
+
+  DNS_RESOLVED="$OUTPUT_DIR/dns-resolved.txt"
+  LIVE_STD="$OUTPUT_DIR/live-std.txt"
+  LIVE_EXT="$OUTPUT_DIR/live-ext.txt"
+  LIVE_CURL="$OUTPUT_DIR/live-curl.txt"
+  printf '' > "$DNS_RESOLVED"
+  printf '' > "$LIVE_STD"
+  printf '' > "$LIVE_EXT"
+  printf '' > "$LIVE_CURL"
+
+  # ── Step 1: DNS pre-filter ──────────────────────────────────
+  printf "  [1/4] DNS resolution filter...\n"
+
+  if command -v dnsx >/dev/null 2>&1; then
+    dnsx -l "$TARGETS" -silent -o "$DNS_RESOLVED" 2>/dev/null
+    printf "        dnsx: %s domains resolved\n" "$(wc -l < "$DNS_RESOLVED" | tr -d ' ')"
+  else
+    # dig or python3 socket fallback — parallel via Python
+    SPIRE_TARGETS="$TARGETS" SPIRE_RESOLVED="$DNS_RESOLVED" \
+    SPIRE_THREADS="$THREADS" python3 << 'DNSEOF'
+import os, socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+targets_f  = os.environ["SPIRE_TARGETS"]
+resolved_f = os.environ["SPIRE_RESOLVED"]
+workers    = max(1, int(os.environ.get("SPIRE_THREADS","40")))
+
+domains = [l.strip() for l in open(targets_f) if l.strip() and not l.startswith("#")]
+total   = len(domains)
+ok      = []
+
+def resolve(domain):
+    try:
+        socket.setdefaulttimeout(5)
+        socket.getaddrinfo(domain, None)
+        return domain
+    except Exception:
+        return None
+
+done = 0
+with ThreadPoolExecutor(max_workers=workers) as ex:
+    futs = {ex.submit(resolve, d): d for d in domains}
+    for f in as_completed(futs):
+        done += 1
+        filled = done * 40 // max(total, 1)
+        bar    = "#" * filled + "." * (40 - filled)
+        pct    = done * 100 // max(total, 1)
+        print(f"\r        [{bar}] {pct:3d}%  resolving...", end="", flush=True)
+        r = f.result()
+        if r:
+            ok.append(r)
+
+print()
+with open(resolved_f, "w") as fh:
+    for d in sorted(set(ok)):
+        fh.write(d + "\n")
+
+dropped = total - len(ok)
+print(f"        socket: {len(ok)} resolved, {dropped} dropped (NXDOMAIN/timeout)")
+DNSEOF
+  fi
+
+  RESOLVED_COUNT=$(wc -l < "$DNS_RESOLVED" | tr -d ' ')
+  printf "  ${G}[+]${N} DNS resolved          : %s / %s\n" "$RESOLVED_COUNT" "$TOTAL"
+
+  # ── Step 2: httpx — standard ports 80, 443 ─────────────────
+  printf "  [2/4] httpx — standard ports (80, 443)...\n"
+  httpx -l "$DNS_RESOLVED" \
+    -ports 80,443 \
+    -o "$LIVE_STD" \
+    -timeout "$TIMEOUT" \
+    -retries 3 \
+    -status-code \
+    -title \
+    -tech-detect \
+    -follow-redirects \
+    -silent 2>/dev/null
+  STD_COUNT=$(awk '{print $1}' "$LIVE_STD" | sort -u | wc -l | tr -d ' ')
+  printf "  ${G}[+]${N} Standard ports hits   : %s\n" "$STD_COUNT"
+
+  # ── Step 3: httpx — extended API ports ─────────────────────
+  printf "  [3/4] httpx — extended API ports...\n"
+  EXTENDED_PORTS="8080,8443,8000,8888,8008,3000,3001,3003,4000,5000,5001,9000,9001,9090,4443,7443,10000"
+  httpx -l "$DNS_RESOLVED" \
+    -ports "$EXTENDED_PORTS" \
+    -o "$LIVE_EXT" \
     -timeout "$TIMEOUT" \
     -retries 2 \
     -status-code \
     -title \
     -tech-detect \
+    -follow-redirects \
     -silent 2>/dev/null
-  awk '{print $1}' "$LIVE" | sort -u > "$LIVE_CLEAN"
+  EXT_COUNT=$(awk '{print $1}' "$LIVE_EXT" | sort -u | wc -l | tr -d ' ')
+  printf "  ${G}[+]${N} Extended ports hits   : %s\n" "$EXT_COUNT"
+
+  # ── Step 4: curl fallback for missed domains ────────────────
+  # Collect domains httpx confirmed, find which resolved domains
+  # never appeared — probe those directly with curl.
+  printf "  [4/4] curl fallback for unconfirmed domains...\n"
+
+  SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'CURLEOF'
+import os, subprocess, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+out_dir  = os.environ["SPIRE_OUT"]
+workers  = max(1, int(os.environ.get("SPIRE_THREADS","40")))
+timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
+
+# All resolved domains
+try:
+    resolved = set(l.strip() for l in open(f"{out_dir}/dns-resolved.txt") if l.strip())
+except:
+    resolved = set()
+
+# Domains httpx already confirmed (extract host from URL)
+confirmed = set()
+for fname in ("live-std.txt", "live-ext.txt"):
+    try:
+        for line in open(f"{out_dir}/{fname}"):
+            url = line.split()[0] if line.strip() else ""
+            m = re.match(r'https?://([^/:]+)', url)
+            if m:
+                confirmed.add(m.group(1).lower())
+    except:
+        pass
+
+# Domains httpx missed
+missed = sorted(resolved - confirmed)
+
+PROBE_PORTS   = [443, 80, 8443, 8080, 8000, 8888, 3000, 5000, 9000, 4443]
+PROBE_SCHEMES = {443:"https", 80:"http", 8443:"https", 8080:"http",
+                 8000:"http", 8888:"http", 3000:"http", 5000:"http",
+                 9000:"http", 4443:"https"}
+
+def probe(domain, port):
+    scheme = PROBE_SCHEMES.get(port, "https")
+    url    = f"{scheme}://{domain}" if port in (80,443) else f"{scheme}://{domain}:{port}"
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+             "--max-time", str(timeout), "--connect-timeout", "5",
+             "-L", "--max-redirs", "3", url],
+            capture_output=True, timeout=timeout + 5)
+        code = r.stdout.decode().strip()
+        # Any real HTTP response (including 4xx/5xx) means the host is live
+        if code and code not in ("000", ""):
+            return url, code
+    except:
+        pass
+    return None, None
+
+total   = len(missed)
+done    = 0
+found   = []
+seen    = set()
+
+tasks = [(d, p) for d in missed for p in PROBE_PORTS]
+
+with ThreadPoolExecutor(max_workers=workers) as ex:
+    futs = {ex.submit(probe, d, p): (d, p) for d, p in tasks}
+    for f in as_completed(futs):
+        domain, port = futs[f]
+        if domain not in seen:
+            done += 1
+            filled = done * 40 // max(total, 1)
+            bar    = "#" * filled + "." * (40 - filled)
+            pct    = done * 100 // max(total, 1)
+            print(f"\r        [{bar}] {pct:3d}%  {domain[:35]:<35}", end="", flush=True)
+        url, code = f.result()
+        if url and domain not in seen:
+            seen.add(domain)
+            found.append(url)
+
+print()
+with open(f"{out_dir}/live-curl.txt", "w") as fh:
+    for u in sorted(set(found)):
+        fh.write(u + "\n")
+
+print(f"        curl fallback : {len(missed)} unchecked → {len(found)} additional live")
+CURLEOF
+
+  CURL_COUNT=$(wc -l < "$LIVE_CURL" | tr -d ' ')
+
+  # ── Step 5: merge all sources into live-clean.txt ───────────
+  {
+    awk '{print $1}' "$LIVE_STD"
+    awk '{print $1}' "$LIVE_EXT"
+    cat "$LIVE_CURL"
+  } | grep -E '^https?://' | sort -u > "$LIVE_CLEAN"
+
+  # Also write a combined httpx-style LIVE file (used by later phases for tech/title)
+  cat "$LIVE_STD" "$LIVE_EXT" > "$LIVE" 2>/dev/null
+
   LIVE_COUNT=$(wc -l < "$LIVE_CLEAN" | tr -d ' ')
-  stop_spinner "httpx complete"
-  printf "  Live hosts confirmed   : %s\n" "$LIVE_COUNT"
+  printf "\n"
+  printf "  ${G}[+]${N} httpx std            : %s\n" "$STD_COUNT"
+  printf "  ${G}[+]${N} httpx extended ports : %s\n" "$EXT_COUNT"
+  printf "  ${G}[+]${N} curl fallback        : %s\n" "$CURL_COUNT"
+  printf "  ${B}[+]${N} Total live hosts     : %s\n" "$LIVE_COUNT"
+
 fi
 
 # ============================================================
@@ -1033,10 +1230,18 @@ for line in auth_lines[2:]:
 
 L.append("\n---\n")
 L.append("## All Parsed Endpoints\n")
-L.append("```")
-for l in ep_lines[:500]: L.append(l.rstrip())
-if total_ep > 500: L.append(f"... ({total_ep - 500} more -- see all-endpoints.txt)")
-L.append("```")
+L.append("| Method | Host | Path |")
+L.append("|--------|------|------|")
+import re as _re
+for l in ep_lines[:500]:
+    # line format: "  [METHOD]  host  /path  [DEPRECATED]"
+    m = _re.match(r'\s+\[(\w+)\s*\]\s+(\S+)\s+(\/\S*)(.*)', l)
+    if m:
+        method, host, path, rest = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+        dep = " `[DEPRECATED]`" if "DEPRECATED" in rest else ""
+        L.append(f"| `{method}` | {host} | `{path}`{dep} |")
+if total_ep > 500:
+    L.append(f"\n_{total_ep - 500} more endpoints — see `all-endpoints.txt`_")
 
 L.append("\n---\n")
 L.append("## Remediation\n")
