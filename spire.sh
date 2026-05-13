@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ============================================================
-#  SPIRE - Spec Path Inspector & Recon Engine  v2.2
+#  SPIRE - Spec Path Inspector & Recon Engine  v2.3
 #
 #  Input (any one of):
 #    ./spire.sh domains.json          # JSON with domain/subdomains
@@ -120,6 +120,7 @@ LIVE="$OUTPUT_DIR/live.txt"
 LIVE_CLEAN="$OUTPUT_DIR/live-clean.txt"
 FFUF_RAW="$OUTPUT_DIR/ffuf-raw.json"
 REAL_SWAGGERS="$OUTPUT_DIR/real-swaggers.txt"
+ACTUATOR_FOUND="$OUTPUT_DIR/actuator-found.txt"
 ENDPOINTS_FILE="$OUTPUT_DIR/all-endpoints.txt"
 AUTH_RESULTS="$OUTPUT_DIR/auth-test.txt"
 VULN_RESULTS="$OUTPUT_DIR/vuln-findings.txt"
@@ -129,13 +130,14 @@ JSON_REPORT="$OUTPUT_DIR/findings.json"
 START_TIME=$(date +%s)
 
 printf '' > "$REAL_SWAGGERS"
+printf '' > "$ACTUATOR_FOUND"
 printf '' > "$ENDPOINTS_FILE"
 printf '' > "$AUTH_RESULTS"
 printf '[]' > "$VULN_RESULTS"
 
 SEP="$(repeat_char 60 '=')"
 
-printf "\n${B}SPIRE  --  Spec Path Inspector & Recon Engine  v2.2${N}\n"
+printf "\n${B}SPIRE  --  Spec Path Inspector & Recon Engine  v2.3${N}\n"
 printf "${D}%s${N}\n" "$SEP"
 printf "  Input        : %s\n" "$INPUT"
 printf "  Output dir   : %s\n" "$OUTPUT_DIR"
@@ -281,6 +283,35 @@ admin/swagger
 backend/api-docs
 backend/swagger
 service/api-docs
+actuator
+actuator/
+actuator/health
+actuator/env
+actuator/beans
+actuator/mappings
+actuator/metrics
+actuator/info
+actuator/logfile
+actuator/heapdump
+actuator/threaddump
+actuator/conditions
+actuator/configprops
+actuator/auditevents
+actuator/httptrace
+actuator/scheduledtasks
+actuator/prometheus
+actuator/flyway
+actuator/liquibase
+actuator/sessions
+actuator/caches
+actuator/integrationgraph
+manage/actuator
+manage/health
+manage/env
+spring/actuator
+api/actuator
+admin/actuator
+app/actuator
 PATHS
 
 PATH_COUNT=$(wc -l < "$WORDLIST" | tr -d ' ')
@@ -311,7 +342,7 @@ except: print(0)
 stop_spinner "ffuf complete  ($RAW_HITS raw hits)"
 
 # ============================================================
-# PHASE 5 – False positive filter  [v2.2: threading + strict validation]
+# PHASE 5 – False positive filter  [v2.3: actuator-aware]
 # ============================================================
 phase_header 5 "Filtering false positives"
 
@@ -327,6 +358,12 @@ phase_header 5 "Filtering false positives"
 #             body must be valid JSON with both ("openapi"|"swagger") AND "paths"
 #             OR valid YAML with the same keys
 #             A JSON error page or bare HTML never passes this gate
+#
+# ── What changed in v2.3 ──────────────────────────────────────
+# Gate 2 now also recognises Spring Actuator JSON responses
+# (_links root, env, beans, health, metrics shapes).
+# Actuator URLs are written to actuator-found.txt separately
+# so they don't contaminate the swagger spec pipeline.
 # ─────────────────────────────────────────────────────────────
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
@@ -352,39 +389,87 @@ def content_type_ok(ct: str) -> bool:
         "json", "yaml", "openapi", "octet-stream", "x-yaml", "text/plain"
     )) and "html" not in ct
 
-def body_is_spec(raw: bytes) -> bool:
+def body_is_spec(raw: bytes):
     """
-    True when the response body is a real OpenAPI/Swagger document.
-    Tries JSON first, then falls back to a lightweight YAML key-scan
-    (avoids a heavy PyYAML import that may not be available).
+    Returns ("swagger", doc)  -- valid OpenAPI/Swagger document
+            ("actuator", doc) -- valid Spring Actuator response
+            (None, None)      -- not a recognised spec
     """
     text = raw.decode("utf-8", errors="ignore")
 
-    # ── JSON gate ────────────────────────────────────────────
     try:
         doc = json.loads(text)
         if not isinstance(doc, dict):
-            return False
+            return None, None
+
+        # ── OpenAPI / Swagger gate ───────────────────────────
         has_version = "openapi" in doc or "swagger" in doc
         has_paths   = "paths" in doc
-        return has_version and has_paths
+        if has_version and has_paths:
+            return "swagger", doc
+
+        # ── Spring Actuator gate ─────────────────────────────
+        # /actuator root  →  {"_links": {"health": {"href": "..."}, ...}}
+        if "_links" in doc and isinstance(doc["_links"], dict):
+            if any(isinstance(v, dict) and "href" in v
+                   for v in doc["_links"].values()):
+                return "actuator", doc
+
+        # /actuator/env
+        if "activeProfiles" in doc or "propertySources" in doc:
+            return "actuator", doc
+
+        # /actuator/beans
+        if "contexts" in doc and isinstance(doc["contexts"], dict):
+            return "actuator", doc
+
+        # /actuator/health
+        if "status" in doc and ("components" in doc or "details" in doc):
+            return "actuator", doc
+
+        # /actuator/metrics  →  {"names": [...]}
+        # /actuator/metrics/xyz  →  {"name": "...", "measurements": [...]}
+        if "names" in doc or "measurements" in doc:
+            return "actuator", doc
+
+        # /actuator/mappings  →  {"contexts": ...}  (caught above)
+        # /actuator/info  →  arbitrary dict, at minimum non-empty
+        # /actuator/configprops  →  {"contexts": ...}  (caught above)
+        # /actuator/threaddump  →  {"threads": [...]}
+        if "threads" in doc and isinstance(doc["threads"], list):
+            return "actuator", doc
+
+        # /actuator/scheduledtasks  →  {"cron": [...], "fixedDelay": [...]}
+        if "cron" in doc or "fixedDelay" in doc or "fixedRate" in doc:
+            return "actuator", doc
+
+        # /actuator/caches  →  {"cacheManagers": {...}}
+        if "cacheManagers" in doc:
+            return "actuator", doc
+
+        # /actuator/sessions  →  {"sessions": {...}}
+        if "sessions" in doc:
+            return "actuator", doc
+
+        return None, None
+
     except json.JSONDecodeError:
         pass
 
     # ── Lightweight YAML key-scan (no import needed) ─────────
-    # Real YAML specs always have top-level "openapi:" / "swagger:"
-    # AND "paths:" — we look for them without a full parser.
     lines = text[:4000].splitlines()
     top_keys = set()
     for line in lines:
         stripped = line.lstrip()
         if stripped and not stripped.startswith("#"):
-            # top-level key = line with no leading spaces and a colon
             if line and line[0] not in (" ", "\t") and ":" in line:
                 top_keys.add(line.split(":")[0].strip().lower())
     has_version = "openapi" in top_keys or "swagger" in top_keys
     has_paths   = "paths" in top_keys
-    return has_version and has_paths
+    if has_version and has_paths:
+        return "swagger", None
+
+    return None, None
 
 # ── Per-URL worker ────────────────────────────────────────────
 def check_url(item):
@@ -398,14 +483,13 @@ def check_url(item):
     try:
         r = subprocess.run(
             ["curl", "-sk", url, "--max-time", str(timeout),
-             "-D", "-",          # include response headers in stdout
+             "-D", "-",
              "--compressed"],
             capture_output=True, timeout=timeout + 5
         )
     except Exception:
         return None
 
-    # Split headers from body
     raw = r.stdout
     sep = b"\r\n\r\n"
     idx = raw.find(sep)
@@ -420,7 +504,6 @@ def check_url(item):
         header_block = ""
         body         = raw
 
-    # Gate 1: Content-Type
     ct = ""
     for line in header_block.splitlines():
         if line.lower().startswith("content-type:"):
@@ -428,13 +511,13 @@ def check_url(item):
             break
 
     if ct and not content_type_ok(ct):
-        return None   # text/html custom 404 → reject
-
-    # Gate 2: body must parse as a real spec
-    if not body_is_spec(body):
         return None
 
-    return {"host": host, "url": url, "size": size}
+    kind, _ = body_is_spec(body)
+    if kind is None:
+        return None
+
+    return {"host": host, "url": url, "size": size, "type": kind}
 
 # ── Baseline sizes (to catch catch-all 200s) ─────────────────
 hosts_items = {}
@@ -453,13 +536,11 @@ def get_baseline(host):
     except Exception:
         return -1
 
-# Fetch baselines in parallel
 with ThreadPoolExecutor(max_workers=min(workers, len(hosts_items) or 1)) as ex:
     futs = {ex.submit(get_baseline, h): h for h in hosts_items}
     for f in as_completed(futs):
         baseline_sizes[futs[f]] = f.result()
 
-# Filter out items whose size matches the catch-all baseline
 flat_items = []
 for host, items in hosts_items.items():
     bl = baseline_sizes.get(host, -1)
@@ -487,17 +568,29 @@ with ThreadPoolExecutor(max_workers=workers) as ex:
 
 print()
 
+# ── Write results to separate files ──────────────────────────
+swagger_findings  = [r for r in real_findings if r["type"] == "swagger"]
+actuator_findings = [r for r in real_findings if r["type"] == "actuator"]
+
 with open(f"{out_dir}/real-swaggers.txt", "w") as f:
-    for r in real_findings:
+    for r in swagger_findings:
         f.write(r["url"] + "\n")
 
-for r in real_findings:
-    print(f"  [found]  {r['url']}  (size: {r['size']})")
+with open(f"{out_dir}/actuator-found.txt", "w") as f:
+    for r in actuator_findings:
+        f.write(r["url"] + "\n")
 
-print(f"\n  Confirmed endpoints    : {len(real_findings)}")
+for r in swagger_findings:
+    print(f"  [swagger ]  {r['url']}  (size: {r['size']})")
+for r in actuator_findings:
+    print(f"  [actuator]  {r['url']}  (size: {r['size']})")
+
+print(f"\n  Confirmed swagger      : {len(swagger_findings)}")
+print(f"  Confirmed actuator     : {len(actuator_findings)}")
 PYEOF
 
 FOUND_COUNT=$(wc -l < "$REAL_SWAGGERS" | tr -d ' ')
+ACTUATOR_COUNT=$(wc -l < "$ACTUATOR_FOUND" | tr -d ' ')
 
 # ============================================================
 # PHASE 6 – Download specs  [v2.2: parallel downloads]
@@ -554,7 +647,6 @@ def process_url(url):
     saved = []
     host = url.split("/")[2] if "/" in url else url
 
-    # 1. Check swagger-initializer.js for configUrl
     init_url    = url.rsplit("/", 1)[0] + "/swagger-initializer.js"
     init_body   = curl_get(init_url).decode("utf-8", errors="ignore")
     import re
@@ -582,13 +674,11 @@ def process_url(url):
         except Exception:
             pass
 
-    # 2. Download the URL itself if it's a spec
     content = curl_get(url, max_time=15)
     if is_spec(content):
         save_spec(content, safe_name(url))
         saved.append(url)
 
-    # 3. Probe common sibling spec paths
     for path in ("/v3/api-docs", "/v2/api-docs", "/openapi.json", "/swagger.json"):
         sib = curl_get(f"https://{host}{path}")
         if is_spec(sib):
@@ -764,6 +854,148 @@ print(f"  Endpoints parsed       : {len(all_endpoints)}")
 print(f"  Issues found           :")
 for s in ["HIGH","MEDIUM","LOW","INFO"]:
     if s in sev: print(f"    {s:<10} {sev[s]}")
+PYEOF
+
+# ============================================================
+# PHASE 7b – Spring Actuator Risk Assessment
+# ============================================================
+phase_header "7b" "Spring Actuator endpoint risk assessment"
+
+SPIRE_OUT="$OUTPUT_DIR" SPIRE_TIMEOUT="$TIMEOUT" SPIRE_THREADS="$THREADS" python3 << 'PYEOF'
+import json, subprocess, os, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+out_dir   = os.environ.get("SPIRE_OUT", "./spire-results")
+timeout   = int(os.environ.get("SPIRE_TIMEOUT", "10"))
+workers   = max(1, int(os.environ.get("SPIRE_THREADS", "40")))
+vuln_file = f"{out_dir}/vuln-findings.txt"
+
+try:    vulns = json.load(open(vuln_file))
+except: vulns = []
+
+try:
+    actuator_urls = [l.strip() for l in open(f"{out_dir}/actuator-found.txt") if l.strip()]
+except:
+    actuator_urls = []
+
+if not actuator_urls:
+    print("  No actuator endpoints to assess.")
+    with open(vuln_file, "w") as f:
+        json.dump(vulns, f, indent=2)
+    exit(0)
+
+# Risk map: url keyword → (severity, description)
+ACTUATOR_RISK = {
+    "heapdump":       ("CRITICAL", "JVM heap dump -- full memory export, credentials may be visible"),
+    "threaddump":     ("HIGH",     "Thread dump -- internal class/method names exposed"),
+    "env":            ("HIGH",     "Environment variables -- may contain API keys, DB passwords"),
+    "configprops":    ("HIGH",     "Configuration properties exposed -- secret leakage risk"),
+    "logfile":        ("HIGH",     "Log file readable -- credentials/PII leakage risk"),
+    "flyway":         ("HIGH",     "Flyway migration history -- DB schema details exposed"),
+    "liquibase":      ("HIGH",     "Liquibase migration history -- DB schema details exposed"),
+    "beans":          ("MEDIUM",   "All Spring beans visible -- architecture reconnaissance"),
+    "mappings":       ("MEDIUM",   "All HTTP mappings visible -- hidden endpoint discovery"),
+    "httptrace":      ("MEDIUM",   "HTTP trace history -- token/session leakage risk"),
+    "auditevents":    ("MEDIUM",   "Audit events -- usernames and actions visible"),
+    "sessions":       ("MEDIUM",   "Active sessions visible -- session hijacking risk"),
+    "integrationgraph":("MEDIUM",  "Spring Integration graph exposed -- internal flow visible"),
+    "conditions":     ("LOW",      "Auto-configuration conditions report exposed"),
+    "scheduledtasks": ("LOW",      "Scheduled task details exposed"),
+    "caches":         ("LOW",      "Cache manager details exposed"),
+    "prometheus":     ("LOW",      "Prometheus metrics -- system info exposed"),
+    "metrics":        ("LOW",      "Metrics endpoint open"),
+    "info":           ("INFO",     "Build/version information exposed"),
+    "health":         ("INFO",     "Health status endpoint open"),
+}
+
+def probe_actuator(url):
+    url_lower = url.lower()
+
+    # Identify which actuator keyword this URL matches
+    matched_keyword = None
+    for keyword in ACTUATOR_RISK:
+        if f"/{keyword}" in url_lower or url_lower.endswith(keyword):
+            matched_keyword = keyword
+            break
+
+    # Live HTTP probe
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+             url, "--max-time", str(timeout)],
+            capture_output=True, timeout=timeout + 5)
+        code = r.stdout.decode().strip()
+    except:
+        code = "ERR"
+
+    if code != "200":
+        return None
+
+    # Matched a known keyword → use its risk entry
+    if matched_keyword:
+        sev, detail = ACTUATOR_RISK[matched_keyword]
+        return {
+            "severity": sev,
+            "type":     f"Spring Actuator Exposed -- /{matched_keyword}",
+            "endpoint": url,
+            "api":      "spring-actuator",
+            "detail":   f"HTTP 200  |  {detail}"
+        }
+
+    # Unmatched but "actuator" in path → fetch body to enumerate sub-endpoints
+    if "actuator" in url_lower:
+        try:
+            r2 = subprocess.run(
+                ["curl", "-sk", url, "--max-time", str(timeout)],
+                capture_output=True, timeout=timeout + 5)
+            body = r2.stdout.decode("utf-8", errors="ignore")
+        except:
+            body = ""
+
+        if "_links" in body:
+            exposed = re.findall(r'"([a-z\-]+)":\s*\{[^}]*"href"', body)
+            return {
+                "severity": "HIGH",
+                "type":     "Spring Actuator Root Exposed",
+                "endpoint": url,
+                "api":      "spring-actuator",
+                "detail":   f"HTTP 200  |  Exposed sub-endpoints: {', '.join(exposed[:15])}"
+            }
+
+    return None
+
+# ── Parallel probing ──────────────────────────────────────────
+total      = len(actuator_urls)
+done_count = 0
+new_vulns  = []
+
+with ThreadPoolExecutor(max_workers=workers) as ex:
+    futs = {ex.submit(probe_actuator, url): url for url in actuator_urls}
+    for f in as_completed(futs):
+        done_count += 1
+        filled = done_count * 40 // max(total, 1)
+        bar    = "#" * filled + "." * (40 - filled)
+        pct    = done_count * 100 // max(total, 1)
+        url    = futs[f]
+        print(f"\r  [{bar}] {pct:3d}%  {url[:38]:<38}", end="", flush=True)
+        result = f.result()
+        if result:
+            new_vulns.append(result)
+
+print()
+
+# Print findings sorted by severity
+sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+for v in sorted(new_vulns, key=lambda x: sev_order.get(x["severity"], 9)):
+    print(f"  [{v['severity']:<8}]  {v['endpoint']}")
+
+vulns.extend(new_vulns)
+
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+print(f"\n  Actuator URLs assessed : {total}")
+print(f"  Risk findings added    : {len(new_vulns)}")
 PYEOF
 
 # ============================================================
@@ -947,6 +1179,9 @@ except: vulns = []
 try:    swagger_urls = [l.strip() for l in open(f"{out_dir}/real-swaggers.txt") if l.strip()]
 except: swagger_urls = []
 
+try:    actuator_urls = [l.strip() for l in open(f"{out_dir}/actuator-found.txt") if l.strip()]
+except: actuator_urls = []
+
 try:    auth_lines = open(f"{out_dir}/auth-test.txt").readlines()
 except: auth_lines = []
 
@@ -980,7 +1215,7 @@ L.append("|-------|-------|")
 L.append(f"| Generated | {now} |")
 L.append(f"| Duration | {elapsed}s |")
 L.append(f"| Input | `{inp}` |")
-L.append(f"| Version | 2.2 |")
+L.append(f"| Version | 2.3 |")
 L.append(f"| Risk Score | {risk} ({rlbl}) |")
 
 L.append("\n---\n")
@@ -990,10 +1225,11 @@ L.append("|--------|-------|")
 L.append(f"| Targets Scanned | {total_t} |")
 L.append(f"| Live Hosts | {live_c} |")
 L.append(f"| Swagger / OpenAPI URLs Found | {len(swagger_urls)} |")
+L.append(f"| Spring Actuator URLs Found | {len(actuator_urls)} |")
 L.append(f"| Spec Files Downloaded | {spec_count} |")
 L.append(f"| Endpoints Parsed | {total_ep} |")
 L.append(f"| Total Issues | {len(vulns)} |")
-for s in ["HIGH","MEDIUM","LOW","INFO"]:
+for s in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
     if s in sev: L.append(f"| {s} | {len(sev[s])} |")
 
 L.append("\n---\n")
@@ -1023,6 +1259,13 @@ for i, url in enumerate(swagger_urls, 1):
     L.append(f"| {i} | {url} |")
 
 L.append("\n---\n")
+L.append("## Discovered Spring Actuator URLs\n")
+L.append("| # | URL |")
+L.append("|---|-----|")
+for i, url in enumerate(actuator_urls, 1):
+    L.append(f"| {i} | {url} |")
+
+L.append("\n---\n")
 L.append("## Live Authentication Test\n")
 L.append("| URL | Code | Status |")
 L.append("|-----|------|--------|")
@@ -1043,17 +1286,26 @@ L.append("## Remediation\n")
 L.append("| Finding | Recommended Action |")
 L.append("|---------|-------------------|")
 for f, a in [
-    ("Missing Authentication",             "Enforce OAuth2 / Bearer on all non-public endpoints"),
-    ("No Security Schemes Defined",        "Define securitySchemes and apply globally via the security field"),
-    ("Sensitive Parameter in Request",     "Move secrets to Authorization header; never query string or cookie"),
-    ("Insecure Transport (HTTP)",          "Enforce HTTPS at the load balancer; reject all HTTP traffic"),
-    ("CORS Wildcard",                      "Restrict Access-Control-Allow-Origin to an explicit allowlist"),
-    ("Dangerous Method on Sensitive Path", "Require elevated roles for destructive methods on privileged paths"),
-    ("Deprecated Endpoint",               "Decommission or apply identical hardening as current endpoints"),
-    ("Hardcoded Secret or API Key",        "Rotate immediately; use a secrets manager, never embed in specs"),
-    ("JWT Token",                          "Revoke the token; never include live credentials in spec examples"),
-    ("Internal IP Address",               "Remove all internal network references from public-facing specs"),
-    ("Unexpected HTTP Method Accepted",   "Return 405 for all disallowed HTTP verbs"),
+    ("Missing Authentication",                   "Enforce OAuth2 / Bearer on all non-public endpoints"),
+    ("No Security Schemes Defined",              "Define securitySchemes and apply globally via the security field"),
+    ("Sensitive Parameter in Request",           "Move secrets to Authorization header; never query string or cookie"),
+    ("Insecure Transport (HTTP)",                "Enforce HTTPS at the load balancer; reject all HTTP traffic"),
+    ("CORS Wildcard",                            "Restrict Access-Control-Allow-Origin to an explicit allowlist"),
+    ("Dangerous Method on Sensitive Path",       "Require elevated roles for destructive methods on privileged paths"),
+    ("Deprecated Endpoint",                     "Decommission or apply identical hardening as current endpoints"),
+    ("Hardcoded Secret or API Key",              "Rotate immediately; use a secrets manager, never embed in specs"),
+    ("JWT Token",                                "Revoke the token; never include live credentials in spec examples"),
+    ("Internal IP Address",                     "Remove all internal network references from public-facing specs"),
+    ("Unexpected HTTP Method Accepted",         "Return 405 for all disallowed HTTP verbs"),
+    ("Spring Actuator Root Exposed",            "Restrict /actuator with Spring Security; disable unused endpoints"),
+    ("Spring Actuator Exposed -- /heapdump",    "DISABLE immediately -- set management.endpoint.heapdump.enabled=false"),
+    ("Spring Actuator Exposed -- /env",         "Disable or restrict -- set management.endpoint.env.enabled=false"),
+    ("Spring Actuator Exposed -- /configprops", "Disable or restrict -- set management.endpoint.configprops.enabled=false"),
+    ("Spring Actuator Exposed -- /threaddump",  "Disable -- set management.endpoint.threaddump.enabled=false"),
+    ("Spring Actuator Exposed -- /logfile",     "Disable -- set management.endpoint.logfile.enabled=false"),
+    ("Spring Actuator Exposed -- /beans",       "Restrict to internal network only"),
+    ("Spring Actuator Exposed -- /mappings",    "Restrict to internal network only"),
+    ("Spring Actuator Exposed -- /httptrace",   "Disable -- set management.endpoint.httptrace.enabled=false"),
 ]: L.append(f"| {f} | {a} |")
 
 L.append("\n---\n")
@@ -1061,25 +1313,30 @@ L.append("## Output Files\n")
 L.append("| File | Description |")
 L.append("|------|-------------|")
 for fn, desc in [
-    ("real-swaggers.txt",  "Confirmed swagger/openapi URLs"),
-    ("specs/",             "Downloaded API specification files"),
-    ("all-endpoints.txt",  "All parsed endpoints with method and path"),
-    ("auth-test.txt",      "Live HTTP response codes per swagger URL"),
-    ("vuln-findings.txt",  "Raw vulnerability data (JSON)"),
-    ("findings.json",      "Machine-readable summary"),
-    ("REPORT.md",          "This report"),
+    ("real-swaggers.txt",   "Confirmed swagger/openapi URLs"),
+    ("actuator-found.txt",  "Confirmed Spring Actuator URLs"),
+    ("specs/",              "Downloaded API specification files"),
+    ("all-endpoints.txt",   "All parsed endpoints with method and path"),
+    ("auth-test.txt",       "Live HTTP response codes per swagger URL"),
+    ("vuln-findings.txt",   "Raw vulnerability data (JSON)"),
+    ("findings.json",       "Machine-readable summary"),
+    ("REPORT.md",           "This report"),
 ]: L.append(f"| `{fn}` | {desc} |")
 
 with open(f"{out_dir}/REPORT.md","w") as f:
     f.write("\n".join(L))
 
-json.dump({"tool":"SPIRE","version":"2.2","scan_date":now,
+json.dump({"tool":"SPIRE","version":"2.3","scan_date":now,
            "duration_seconds":elapsed,"risk_score":risk,"risk_label":rlbl,
            "stats":{"targets":total_t,"live_hosts":live_c,
-                    "swagger_urls":len(swagger_urls),"specs":spec_count,
+                    "swagger_urls":len(swagger_urls),
+                    "actuator_urls":len(actuator_urls),
+                    "specs":spec_count,
                     "endpoints":total_ep,"issues":len(vulns)},
            "severity_breakdown":{k:len(v) for k,v in sev.items()},
-           "swagger_urls":swagger_urls,"findings":vulns},
+           "swagger_urls":swagger_urls,
+           "actuator_urls":actuator_urls,
+           "findings":vulns},
           open(f"{out_dir}/findings.json","w"), indent=2)
 
 print("  REPORT.md written")
@@ -1098,6 +1355,7 @@ printf "${D}%s${N}\n" "$SEP"
 printf "${B}  SPIRE scan complete${N}\n"
 printf "${D}%s${N}\n" "$SEP"
 printf "  ${G}[+]${N} Swagger URLs found   : %s\n" "$(wc -l < "$REAL_SWAGGERS" | tr -d ' ')"
+printf "  ${G}[+]${N} Actuator URLs found  : %s\n" "$(wc -l < "$ACTUATOR_FOUND" | tr -d ' ')"
 printf "  ${G}[+]${N} Endpoints parsed     : %s\n" "$(grep -c '^\s*\[' "$ENDPOINTS_FILE" 2>/dev/null || printf 0)"
 printf "  ${G}[+]${N} Issues flagged       : %s\n" "$ISSUE_COUNT"
 printf "  ${G}[+]${N} Duration             : %ss\n" "$ELAPSED"
