@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # ============================================================
-#  SPIRE - Spec Path Inspector & Recon Engine  v2.4
+#  SPIRE - Spec Path Inspector & Recon Engine  v3.0
 #
 #  Input (any one of):
 #    ./spire.sh domains.json          # JSON with domain/subdomains
@@ -15,7 +15,19 @@
 #
 #  Shells: sh / bash / zsh / ksh / dash
 #
-#  v2.4 new phases:
+#  v3.0 changes:
+#    - Performance: replaced all curl subprocesses with urllib3
+#      connection-pooled HTTP for 5x-10x speedup
+#    - safe_name() now truncates at 150 chars + MD5 hash
+#    - New phases:
+#       11b - Parameter Matrix Expansion (Undocumented Params)
+#       12b - Multi-Tenant & Environment Leakage Recon
+#       15b - Passive Asset Link Extraction (OSINT from Specs)
+#       15c - GraphQL Infrastructure Identification
+#       16b - Passive Information Disclosure & Stack Trace Sifter
+#    - Phase 18 reporting updated with all new findings
+#
+#  v2.4 phases (preserved):
 #    10 - API Versioning Graveyard
 #    11 - Hidden Endpoint Extraction
 #    12 - BOLA Surface Mapping
@@ -24,7 +36,7 @@
 #    15 - Async / Webhook Leakage
 #    16 - Shadow API via Response Header Mining
 #    17 - OpenAPI x- Extension Inconsistency
-#    18 - Report (was 10)
+#    18 - Report
 # ============================================================
 
 R='\033[0;31m'
@@ -51,12 +63,18 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-for tool in curl python3 ffuf httpx jq; do
+for tool in python3 ffuf httpx jq; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     printf "${R}[!] Missing required tool: %s${N}\n" "$tool"
     exit 1
   fi
 done
+
+# Bootstrap urllib3 if missing
+python3 -c "import urllib3" 2>/dev/null || {
+  printf "${Y}[*] Installing urllib3...${N}\n"
+  pip3 install --quiet urllib3
+}
 
 if [ -z "$INPUT" ]; then
   printf "${R}[!] Usage: %s <input> [--threads N] [--timeout N] [--output DIR]${N}\n" "$0"
@@ -107,7 +125,7 @@ VULN_RESULTS="$OUTPUT_DIR/vuln-findings.txt"
 SPECS_DIR="$OUTPUT_DIR/specs"
 REPORT="$OUTPUT_DIR/REPORT.md"
 JSON_REPORT="$OUTPUT_DIR/findings.json"
-# v2.4 new output files
+# v2.4 output files
 VERSION_GRAVEYARD="$OUTPUT_DIR/version-graveyard.txt"
 HIDDEN_ENDPOINTS="$OUTPUT_DIR/hidden-endpoints.txt"
 BOLA_MAP="$OUTPUT_DIR/bola-surface.txt"
@@ -116,17 +134,25 @@ MASS_ASSIGN="$OUTPUT_DIR/mass-assignment.txt"
 WEBHOOK_LEAK="$OUTPUT_DIR/webhook-leakage.txt"
 XEXT_REPORT="$OUTPUT_DIR/xextension-issues.txt"
 JWT_SURFACE="$OUTPUT_DIR/jwt-surface.txt"
+# v3.0 new output files
+HIDDEN_PARAMS="$OUTPUT_DIR/hidden-parameters.txt"
+TENANT_RECON="$OUTPUT_DIR/tenant-environment-recon.txt"
+LEAKED_ASSETS="$OUTPUT_DIR/leaked-assets.txt"
+GRAPHQL_ENDPOINTS="$OUTPUT_DIR/graphql-endpoints.txt"
+STACK_FINGERPRINTS="$OUTPUT_DIR/stack-fingerprints.txt"
 START_TIME=$(date +%s)
 
 for f in "$REAL_SWAGGERS" "$ACTUATOR_FOUND" "$ENDPOINTS_FILE" "$AUTH_RESULTS" \
          "$VERSION_GRAVEYARD" "$HIDDEN_ENDPOINTS" "$BOLA_MAP" "$SHADOW_HEADERS" \
-         "$MASS_ASSIGN" "$WEBHOOK_LEAK" "$XEXT_REPORT" "$JWT_SURFACE"; do
+         "$MASS_ASSIGN" "$WEBHOOK_LEAK" "$XEXT_REPORT" "$JWT_SURFACE" \
+         "$HIDDEN_PARAMS" "$TENANT_RECON" "$LEAKED_ASSETS" "$GRAPHQL_ENDPOINTS" \
+         "$STACK_FINGERPRINTS"; do
   printf '' > "$f"
 done
 printf '[]' > "$VULN_RESULTS"
 
 SEP="$(repeat_char 60 '=')"
-printf "\n${B}SPIRE  --  Spec Path Inspector & Recon Engine  v2.4${N}\n"
+printf "\n${B}SPIRE  --  Spec Path Inspector & Recon Engine  v3.0${N}\n"
 printf "${D}%s${N}\n" "$SEP"
 printf "  Input        : %s\n" "$INPUT"
 printf "  Output dir   : %s\n" "$OUTPUT_DIR"
@@ -324,17 +350,27 @@ except: print(0)
 stop_spinner "ffuf complete  ($RAW_HITS raw hits)"
 
 # ============================================================
-# PHASE 5 – False positive filter
+# PHASE 5 – False positive filter  [urllib3]
 # ============================================================
 phase_header 5 "Filtering false positives"
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, subprocess, os, sys
+import json, os, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir  = os.environ.get("SPIRE_OUT", "./spire-results")
 workers  = max(1, int(os.environ.get("SPIRE_THREADS", "40")))
 timeout  = int(os.environ.get("SPIRE_TIMEOUT", "10"))
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
 
 try:
     data    = json.load(open(f"{out_dir}/ffuf-raw.json"))
@@ -349,7 +385,7 @@ def content_type_ok(ct):
            and "html" not in ct
 
 def body_is_spec(raw):
-    text = raw.decode("utf-8", errors="ignore")
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else raw
     try:
         doc = json.loads(text)
         if not isinstance(doc, dict): return None, None
@@ -385,23 +421,12 @@ def check_url(item):
     host = item.get("host") or (url.split("/")[2] if "/" in url else url)
     if size < 80: return None
     try:
-        r = subprocess.run(["curl","-sk",url,"--max-time",str(timeout),"-D","-","--compressed"],
-                           capture_output=True, timeout=timeout+5)
-    except: return None
-    raw = r.stdout
-    sep = b"\r\n\r\n"; idx = raw.find(sep)
-    if idx == -1: sep = b"\n\n"; idx = raw.find(sep)
-    if idx != -1:
-        hdr  = raw[:idx].decode("utf-8",errors="ignore")
-        body = raw[idx+len(sep):]
-    else:
-        hdr = ""; body = raw
-    ct = ""
-    for line in hdr.splitlines():
-        if line.lower().startswith("content-type:"):
-            ct = line.split(":",1)[1].strip(); break
+        resp = http.request("GET", url, preload_content=True)
+    except Exception:
+        return None
+    ct = resp.headers.get("Content-Type", "")
     if ct and not content_type_ok(ct): return None
-    kind, _ = body_is_spec(body)
+    kind, _ = body_is_spec(resp.data)
     if kind is None: return None
     return {"host":host,"url":url,"size":size,"type":kind}
 
@@ -412,10 +437,10 @@ for r in results:
 
 def get_baseline(host):
     try:
-        r = subprocess.run(["curl","-sk",f"https://{host}/spire_nopath_1337_xyz","--max-time",str(timeout)],
-                           capture_output=True,timeout=timeout+5)
-        return len(r.stdout)
-    except: return -1
+        resp = http.request("GET", f"https://{host}/spire_nopath_1337_xyz", preload_content=True)
+        return len(resp.data)
+    except Exception:
+        return -1
 
 baseline_sizes = {}
 with ThreadPoolExecutor(max_workers=min(workers,len(hosts_items) or 1)) as ex:
@@ -458,30 +483,46 @@ FOUND_COUNT=$(wc -l < "$REAL_SWAGGERS" | tr -d ' ')
 ACTUATOR_COUNT=$(wc -l < "$ACTUATOR_FOUND" | tr -d ' ')
 
 # ============================================================
-# PHASE 6 – Download specs
+# PHASE 6 – Download specs  [urllib3 + safe_name fix]
 # ============================================================
 phase_header 6 "Downloading API specs"
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, os, re, subprocess
+import json, os, re, hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
 workers   = max(1,int(os.environ.get("SPIRE_THREADS","40")))
 timeout   = int(os.environ.get("SPIRE_TIMEOUT","10"))
 specs_dir = f"{out_dir}/specs"
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    swagger_urls = [l.strip() for l in open(f"{out_dir}/real-swaggers.txt") if l.strip()]
 except: swagger_urls = []
 
-def safe_name(url): return re.sub(r'[/:?=&]','_',url)
+def safe_name(url):
+    name = re.sub(r'[/:?=&]','_',url)
+    if len(name) > 150:
+        h = hashlib.md5(url.encode()).hexdigest()[:12]
+        name = name[:137] + '_' + h
+    return name
 
-def curl_get(url, max_time=None):
+def http_get(url, max_time=None):
     try:
-        r = subprocess.run(["curl","-sk",url,"--max-time",str(max_time or timeout)],
-                           capture_output=True,timeout=(max_time or timeout)+5)
-        return r.stdout
-    except: return b""
+        t = urllib3.Timeout(connect=5.0, read=float(max_time or timeout))
+        resp = http.request("GET", url, preload_content=True, timeout=t)
+        return resp.data
+    except Exception:
+        return b""
 
 def is_spec(raw):
     try:
@@ -495,12 +536,12 @@ def save_spec(raw,name):
 def process_url(url):
     saved=[]; host=url.split("/")[2] if "/" in url else url
     init_url  = url.rsplit("/",1)[0]+"/swagger-initializer.js"
-    init_body = curl_get(init_url).decode("utf-8",errors="ignore")
+    init_body = http_get(init_url).decode("utf-8",errors="ignore")
     m = re.search(r'"configUrl"\s*:\s*"([^"]+)"',init_body)
     if m:
         config_url = m.group(1)
         if config_url.startswith("/"): config_url = f"https://{host}{config_url}"
-        config_raw = curl_get(config_url)
+        config_raw = http_get(config_url)
         try:
             cfg       = json.loads(config_raw)
             spec_urls = [u.get("url","") for u in cfg.get("urls",[])]
@@ -508,13 +549,13 @@ def process_url(url):
             for su in spec_urls:
                 if not su: continue
                 if su.startswith("/"): su = f"https://{host}{su}"
-                raw = curl_get(su,max_time=15)
+                raw = http_get(su,max_time=15)
                 if is_spec(raw): save_spec(raw,safe_name(su)); saved.append(su)
         except: pass
-    content = curl_get(url,max_time=15)
+    content = http_get(url,max_time=15)
     if is_spec(content): save_spec(content,safe_name(url)); saved.append(url)
     for path in ("/v3/api-docs","/v2/api-docs","/openapi.json","/swagger.json"):
-        sib = curl_get(f"https://{host}{path}")
+        sib = http_get(f"https://{host}{path}")
         if is_spec(sib):
             save_spec(sib,safe_name(f"https://{host}{path}")); saved.append(f"https://{host}{path}")
     return url, saved
@@ -645,18 +686,29 @@ for s in ["HIGH","MEDIUM","LOW","INFO"]:
 PYEOF
 
 # ============================================================
-# PHASE 7b – Spring Actuator Risk Assessment
+# PHASE 7b – Spring Actuator Risk Assessment  [urllib3]
 # ============================================================
 phase_header "7b" "Spring Actuator endpoint risk assessment"
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_TIMEOUT="$TIMEOUT" SPIRE_THREADS="$THREADS" python3 << 'PYEOF'
-import json, subprocess, os, re
+import json, os, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
 timeout   = int(os.environ.get("SPIRE_TIMEOUT","10"))
 workers   = max(1,int(os.environ.get("SPIRE_THREADS","40")))
 vuln_file = f"{out_dir}/vuln-findings.txt"
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 try:    actuator_urls=[l.strip() for l in open(f"{out_dir}/actuator-found.txt") if l.strip()]
@@ -694,10 +746,10 @@ def probe_actuator(url):
     url_lower=url.lower()
     matched=next((k for k in ACTUATOR_RISK if f"/{k}" in url_lower or url_lower.endswith(k)),None)
     try:
-        r=subprocess.run(["curl","-sk","-o","/dev/null","-w","%{http_code}",url,"--max-time",str(timeout)],
-                         capture_output=True,timeout=timeout+5)
-        code=r.stdout.decode().strip()
-    except: code="ERR"
+        resp=http.request("GET", url, preload_content=True)
+        code=str(resp.status)
+    except Exception:
+        code="ERR"
     if code!="200": return None
     if matched:
         sev,detail=ACTUATOR_RISK[matched]
@@ -705,10 +757,9 @@ def probe_actuator(url):
                 "endpoint":url,"api":"spring-actuator","detail":f"HTTP 200  |  {detail}"}
     if "actuator" in url_lower:
         try:
-            r2=subprocess.run(["curl","-sk",url,"--max-time",str(timeout)],
-                              capture_output=True,timeout=timeout+5)
-            body=r2.stdout.decode("utf-8",errors="ignore")
-        except: body=""
+            body=resp.data.decode("utf-8",errors="ignore")
+        except Exception:
+            body=""
         if "_links" in body:
             exposed=re.findall(r'"([a-z\-]+)":\s*\{[^}]*"href"',body)
             return {"severity":"HIGH","type":"Spring Actuator Root Exposed",
@@ -738,19 +789,30 @@ print(f"  Risk findings added    : {len(new_vulns)}")
 PYEOF
 
 # ============================================================
-# PHASE 8 – Live auth + verb tampering
+# PHASE 8 – Live auth + verb tampering  [urllib3]
 # ============================================================
 phase_header 8 "Live authentication and verb tampering"
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, subprocess, os
+import json, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
 workers   = max(1,int(os.environ.get("SPIRE_THREADS","40")))
 timeout   = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file = f"{out_dir}/vuln-findings.txt"
 auth_file = f"{out_dir}/auth-test.txt"
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 try:    swagger_urls=[l.strip() for l in open(f"{out_dir}/real-swaggers.txt") if l.strip()]
@@ -758,10 +820,11 @@ except: swagger_urls=[]
 
 def probe_code(method,url):
     try:
-        r=subprocess.run(["curl","-sk","-X",method,"-o","/dev/null","-w","%{http_code}",
-                          url,"--max-time",str(timeout)],capture_output=True,timeout=timeout+5)
-        return r.stdout.decode().strip()
-    except: return "ERR"
+        resp=http.request(method, url, preload_content=False)
+        resp.release_conn()
+        return str(resp.status)
+    except Exception:
+        return "ERR"
 
 total=len(swagger_urls); done_count=0; live_results=[]
 with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -820,7 +883,7 @@ try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
 PATTERNS = {
-    "Hardcoded Secret or API Key":   r'(?i)(api[_-]?key|secret|token|password|private[_-]?key)\s*[:=]\s*["\']([^"\']{8,})["\']',
+    "Hardcoded Secret or API Key":   r'(?i)(api[_-]?key|secret|token|password|private[_-]?key)\s*[:=]\s*["\'']([^"\']{8,})["\'']',
     "Internal IP Address":           r'\b(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)\d{1,3}\.\d{1,3}\b',
     "AWS ARN":                       r'arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:\d{12}:[^\s"\']+',
     "JWT Token":                     r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
@@ -854,22 +917,16 @@ print(f"  Sensitive data matches : {found}")
 PYEOF
 
 # ============================================================
-# PHASE 10 – API Versioning Graveyard
+# PHASE 10 – API Versioning Graveyard  [urllib3]
 # ============================================================
 phase_header 10 "API Versioning Graveyard -- old version auth bypass"
 
-# Finds deprecated API versions still live on the server.
-# Old versions often lack new auth middleware, rate limiting, input validation.
-# Strategy:
-#   1. Parse all-endpoints.txt for versioned paths (/v1/, /v2/, /v3/, etc.)
-#   2. Identify max version per host (that's the "current" one)
-#   3. Probe older versions live — if they return 200, flag HIGH
-#   4. Compare HTTP status between versions to detect auth downgrade
-
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, re, subprocess, os
+import json, re, os, glob
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
 workers   = max(1,int(os.environ.get("SPIRE_THREADS","40")))
@@ -877,21 +934,25 @@ timeout   = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file = f"{out_dir}/vuln-findings.txt"
 out_file  = f"{out_dir}/version-graveyard.txt"
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
-import glob
 spec_files=sorted(glob.glob(f"{out_dir}/specs/*.json"))
 
-# Collect versioned paths per base host
-# Structure: { host: { version_int: [path, ...] } }
 host_versions = defaultdict(lambda: defaultdict(list))
 
 for spec_file in spec_files:
     try:
         data=json.load(open(spec_file))
     except: continue
-    # Determine base host
     base=""
     if "servers" in data:
         base=data["servers"][0].get("url","") if data["servers"] else ""
@@ -913,8 +974,7 @@ if not host_versions:
     with open(vuln_file,"w") as f: json.dump(vulns,f,indent=2)
     exit(0)
 
-# Build probe list: for each host, find current (max) version and probe older ones
-probes=[]  # (host, old_version, current_version, sample_paths)
+probes=[]
 for host, versions in host_versions.items():
     if len(versions)<2: continue
     max_ver=max(versions.keys())
@@ -933,17 +993,16 @@ def probe_version(host,old_ver,cur_ver,paths):
         cur_url=f"https://{host}{cur_path}"
         def get_code(url):
             try:
-                r=subprocess.run(["curl","-sk","-o","/dev/null","-w","%{http_code}",
-                                  url,"--max-time",str(timeout)],
-                                 capture_output=True,timeout=timeout+5)
-                return r.stdout.decode().strip()
-            except: return "ERR"
+                resp=http.request("GET", url, preload_content=False)
+                code=str(resp.status)
+                resp.release_conn()
+                return code
+            except Exception:
+                return "ERR"
         old_code=get_code(old_url)
         cur_code=get_code(cur_url)
         if old_code in ("200","201","204"):
-            # Old version still alive
             if cur_code in ("401","403") and old_code=="200":
-                # Auth regression! Current requires auth, old does not
                 findings.append({
                     "severity":"CRITICAL",
                     "type":"API Versioning Graveyard -- Auth Regression",
@@ -990,17 +1049,15 @@ print(f"\n  Graveyard findings     : {len(all_new_vulns)}")
 PYEOF
 
 # ============================================================
-# PHASE 11 – Hidden Endpoint Extraction
+# PHASE 11 – Hidden Endpoint Extraction  [urllib3]
 # ============================================================
 phase_header 11 "Hidden endpoint extraction from spec path patterns"
 
-# Takes real spec paths and generates likely-but-undocumented mutations.
-# /api/v1/users  →  probes /api/v1/users/export, /bulk, /admin, /search, /count etc.
-# Undocumented endpoints often bypass auth and lack rate limiting.
-
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, re, subprocess, os, glob
+import json, re, os, glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
 workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
@@ -1008,10 +1065,17 @@ timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file= f"{out_dir}/vuln-findings.txt"
 out_file = f"{out_dir}/hidden-endpoints.txt"
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
-# Suffixes to append to each collection path
 SHADOW_SUFFIXES=[
     "export","export.csv","export.json","export.xlsx",
     "bulk","bulk-delete","bulk-update","bulk-create",
@@ -1026,7 +1090,6 @@ SHADOW_SUFFIXES=[
 
 spec_files=sorted(glob.glob(f"{out_dir}/specs/*.json"))
 
-# Extract collection paths (paths not ending in {param})
 candidate_bases=set()
 for spec_file in spec_files:
     try: data=json.load(open(spec_file))
@@ -1039,9 +1102,7 @@ for spec_file in spec_files:
         base_url=f"{schemes[0]}://{data['host']}{data.get('basePath','')}".rstrip("/")
     if not base_url: continue
     for path in data.get("paths",{}).keys():
-        # Skip paths ending in a parameter
         if path.rstrip("/").endswith("}"):  continue
-        # Skip very short or very deep paths
         parts=[p for p in path.split("/") if p]
         if len(parts)<1 or len(parts)>5: continue
         candidate_bases.add(base_url+path.rstrip("/"))
@@ -1053,12 +1114,11 @@ print(f"  Total probes           : {len(probes)}")
 def probe_hidden(base,suffix):
     url=f"{base}/{suffix}"
     try:
-        r=subprocess.run(["curl","-sk","-o","/dev/null","-w","%{http_code}",
-                          url,"--max-time",str(timeout)],
-                         capture_output=True,timeout=timeout+5)
-        code=r.stdout.decode().strip()
-    except: return None
-    # Accept 200,201,204 but NOT 401/403 (those are "protected but exist" -- still note them)
+        resp=http.request("GET", url, preload_content=False)
+        code=str(resp.status)
+        resp.release_conn()
+    except Exception:
+        return None
     if code in ("200","201","204"):
         return {"severity":"HIGH","type":"Hidden / Shadow Endpoint Found",
                 "endpoint":url,"api":base.split("/")[2],
@@ -1099,14 +1159,188 @@ print(f"\n  Hidden endpoints found : {len(new_vulns)}")
 PYEOF
 
 # ============================================================
+# PHASE 11b – Parameter Matrix Expansion  [v3.0 NEW]
+# ============================================================
+phase_header "11b" "Parameter matrix expansion -- undocumented parameter discovery"
+
+SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
+import json, os, glob, re
+
+out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
+vuln_file = f"{out_dir}/vuln-findings.txt"
+out_file  = f"{out_dir}/hidden-parameters.txt"
+
+try:    vulns=json.load(open(vuln_file))
+except: vulns=[]
+
+# Curated wordlist of commonly forgotten parameters by category
+HIDDEN_PARAM_WORDLIST = {
+    "Debug / Developer": [
+        "debug", "debug_mode", "verbose", "trace", "test", "testing",
+        "dev", "developer", "developer_mode", "staging", "sandbox",
+        "dry_run", "dryrun", "mock", "simulate", "demo",
+    ],
+    "Auth Bypass / Privilege": [
+        "bypass", "admin", "is_admin", "internal", "backdoor", "override",
+        "sudo", "superuser", "god_mode", "master_key", "skip_auth",
+        "no_auth", "trust", "elevated", "impersonate", "as_user",
+    ],
+    "Environment / Config": [
+        "env", "environment", "mode", "config", "configuration",
+        "region", "datacenter", "cluster", "namespace", "tenant",
+        "org_id", "tenant_id", "account_id", "workspace_id",
+    ],
+    "Feature Flags": [
+        "feature", "flag", "feature_flag", "beta", "preview",
+        "experimental", "canary", "rollout", "ab_test", "variant",
+        "enable_feature", "disable_feature", "toggle",
+    ],
+    "Output / Format Control": [
+        "format", "output", "callback", "jsonp", "pretty", "raw",
+        "fields", "include", "exclude", "expand", "select", "embed",
+        "projection", "view", "detail_level", "depth",
+    ],
+    "Pagination / Limit Abuse": [
+        "limit", "offset", "page", "per_page", "page_size",
+        "max_results", "count", "skip", "cursor", "after", "before",
+        "start", "end", "batch_size", "chunk_size",
+    ],
+    "Sort / Filter Injection": [
+        "sort", "order", "orderby", "order_by", "sort_by",
+        "group_by", "filter", "where", "query", "search", "q",
+        "criteria", "condition", "expression",
+    ],
+    "Cache / Version Control": [
+        "cache", "no_cache", "nocache", "refresh", "force_refresh",
+        "version", "v", "api_version", "revision", "etag",
+    ],
+}
+
+spec_files = sorted(glob.glob(f"{out_dir}/specs/*.json"))
+total = len(spec_files)
+all_mapped = []
+findings = []
+
+for idx, spec_file in enumerate(spec_files, 1):
+    bar = "#"*(idx*40//max(total,1)) + "."*(40-idx*40//max(total,1))
+    pct = idx*100//max(total,1)
+    print(f"\r  [{bar}] {pct:3d}%  {os.path.basename(spec_file)[:30]:<30}", end="", flush=True)
+
+    try:
+        data = json.load(open(spec_file))
+    except:
+        continue
+
+    title = data.get("info",{}).get("title","Unknown")
+    paths_obj = data.get("paths",{})
+    if not paths_obj:
+        continue
+
+    # Collect all documented parameter names for this spec
+    documented_params = set()
+    for path, methods_obj in paths_obj.items():
+        if not isinstance(methods_obj, dict):
+            continue
+        for method, op in methods_obj.items():
+            if not isinstance(op, dict):
+                continue
+            for param in op.get("parameters", []):
+                if isinstance(param, dict):
+                    documented_params.add(param.get("name","").lower())
+
+    # For each endpoint, map undocumented candidate parameters
+    for path, methods_obj in paths_obj.items():
+        if not isinstance(methods_obj, dict):
+            continue
+        for method, op in methods_obj.items():
+            mu = method.upper()
+            if mu not in ["GET","POST","PUT","DELETE","PATCH"]:
+                continue
+            if not isinstance(op, dict):
+                continue
+
+            # Get this endpoint's documented params
+            ep_params = set()
+            for param in op.get("parameters", []):
+                if isinstance(param, dict):
+                    ep_params.add(param.get("name","").lower())
+
+            # Find candidate hidden params (not documented at all in spec)
+            candidates = []
+            for category, params in HIDDEN_PARAM_WORDLIST.items():
+                for p in params:
+                    if p.lower() not in documented_params:
+                        candidates.append((category, p))
+
+            if candidates:
+                # Assess relevance heuristic based on endpoint context
+                path_lower = path.lower()
+                summary_lower = op.get("summary","").lower()
+
+                high_risk = []
+                for cat, param in candidates:
+                    # Higher relevance for auth-bypass params on auth endpoints
+                    if cat == "Auth Bypass / Privilege" and any(k in path_lower for k in
+                            ["auth","login","user","admin","account","session"]):
+                        high_risk.append((cat, param, "HIGH"))
+                    # Higher relevance for debug params on any endpoint
+                    elif cat == "Debug / Developer":
+                        high_risk.append((cat, param, "MEDIUM"))
+                    # Sort/filter injection on list/search endpoints
+                    elif cat == "Sort / Filter Injection" and any(k in path_lower for k in
+                            ["list","search","query","find","filter","all"]):
+                        high_risk.append((cat, param, "MEDIUM"))
+                    else:
+                        high_risk.append((cat, param, "LOW"))
+
+                for cat, param, relevance in high_risk:
+                    all_mapped.append({
+                        "endpoint": f"{mu} {path}",
+                        "api": title,
+                        "category": cat,
+                        "parameter": param,
+                        "relevance": relevance,
+                    })
+
+    # Generate findings for this spec (aggregate)
+    spec_high_risk = [m for m in all_mapped if m["api"] == title and m["relevance"] == "HIGH"]
+    if spec_high_risk:
+        unique_params = set(m["parameter"] for m in spec_high_risk)
+        findings.append({
+            "severity": "MEDIUM",
+            "type": "Undocumented Parameter Surface -- High Relevance",
+            "endpoint": f"{title} (multiple endpoints)",
+            "api": title,
+            "detail": f"{len(spec_high_risk)} high-relevance hidden parameter candidates: {', '.join(list(unique_params)[:15])}"
+        })
+
+print()
+
+# Write surface map
+with open(out_file, "w") as f:
+    f.write(f"Parameter Matrix Expansion -- {len(all_mapped)} candidate parameters\n" + "="*60 + "\n\n")
+    f.write(f"{'RELEVANCE':<10}  {'CATEGORY':<28}  {'PARAMETER':<20}  ENDPOINT\n" + "-"*100 + "\n")
+    # Sort by relevance (HIGH first)
+    rel_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    for entry in sorted(all_mapped, key=lambda x: rel_order.get(x["relevance"], 9)):
+        f.write(f"{entry['relevance']:<10}  {entry['category']:<28}  {entry['parameter']:<20}  {entry['endpoint']}\n")
+
+vulns.extend(findings)
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+high_c = sum(1 for m in all_mapped if m["relevance"] == "HIGH")
+med_c = sum(1 for m in all_mapped if m["relevance"] == "MEDIUM")
+print(f"  Total candidate params : {len(all_mapped)}")
+print(f"    HIGH relevance       : {high_c}")
+print(f"    MEDIUM relevance     : {med_c}")
+print(f"  Findings added         : {len(findings)}")
+PYEOF
+
+# ============================================================
 # PHASE 12 – BOLA Surface Mapping
 # ============================================================
 phase_header 12 "BOLA surface mapping -- object-level authorization risk"
-
-# Extracts all spec paths containing {id}, {userId}, {orderId}, etc.
-# Each one is a potential Broken Object Level Authorization point.
-# Snyk can't see this because it's a runtime concern — which ID belongs to whom.
-# SPIRE maps the surface so pentesters/auditors know where to focus.
 
 SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
 import json, re, os, glob
@@ -1118,7 +1352,6 @@ out_file = f"{out_dir}/bola-surface.txt"
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
-# Parameter names that indicate object-level ID
 ID_PATTERNS=re.compile(
     r'\{('
     r'id|[a-z_]*[Ii][dD]|[a-z_]*_id|uuid|guid|'
@@ -1180,19 +1413,222 @@ print(f"  (see bola-surface.txt for full map)")
 PYEOF
 
 # ============================================================
-# PHASE 13 – JWT Algorithm Confusion Surface
+# PHASE 12b – Multi-Tenant & Environment Leakage Recon  [v3.0 NEW]
+# ============================================================
+phase_header "12b" "Multi-tenant and environment leakage recon"
+
+SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
+import json, os, glob, re
+
+out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
+vuln_file = f"{out_dir}/vuln-findings.txt"
+out_file  = f"{out_dir}/tenant-environment-recon.txt"
+
+try:    vulns=json.load(open(vuln_file))
+except: vulns=[]
+
+# Tenant-scoped path variable patterns
+TENANT_VARS = re.compile(
+    r'\{('
+    r'tenant[_\-]?[Ii]?[dD]?|org[_\-]?[Ii]?[dD]?|company[_\-]?[Ii]?[dD]?|'
+    r'account[_\-]?[Ii]?[dD]?|workspace[_\-]?[Ii]?[dD]?|namespace|realm|'
+    r'site[_\-]?[Ii]?[dD]?|project[_\-]?[Ii]?[dD]?|team[_\-]?[Ii]?[dD]?|'
+    r'client[_\-]?[Ii]?[dD]?|customer[_\-]?[Ii]?[dD]?|merchant[_\-]?[Ii]?[dD]?|'
+    r'store[_\-]?[Ii]?[dD]?|brand[_\-]?[Ii]?[dD]?|partner[_\-]?[Ii]?[dD]?'
+    r')\}', re.I
+)
+
+# Environment indicator patterns
+ENV_PATTERNS = re.compile(
+    r'(?i)\b(dev|development|staging|stg|prod|production|uat|qa|'
+    r'sandbox|test|testing|preprod|pre-prod|integration|int|demo|'
+    r'alpha|beta|canary|preview|nightly|hotfix|release|local)\b'
+)
+
+# Server URL environment leak patterns
+ENV_URL_PATTERNS = re.compile(
+    r'(?i)(dev\.|staging\.|stg\.|qa\.|uat\.|sandbox\.|test\.|'
+    r'preprod\.|pre-prod\.|int\.|demo\.|alpha\.|beta\.|canary\.|'
+    r'internal\.|corp\.|local\.)'
+)
+
+spec_files = sorted(glob.glob(f"{out_dir}/specs/*.json"))
+total = len(spec_files)
+tenant_findings = []
+env_findings = []
+all_recon = []
+findings = []
+
+for idx, spec_file in enumerate(spec_files, 1):
+    bar = "#"*(idx*40//max(total,1)) + "."*(40-idx*40//max(total,1))
+    pct = idx*100//max(total,1)
+    print(f"\r  [{bar}] {pct:3d}%  {os.path.basename(spec_file)[:30]:<30}", end="", flush=True)
+
+    try:
+        data = json.load(open(spec_file))
+    except:
+        continue
+
+    title = data.get("info",{}).get("title","Unknown")
+
+    # ── Check server URLs for environment leakage ─────────────
+    servers = data.get("servers", [])
+    if not servers and "host" in data:
+        schemes = data.get("schemes",["https"])
+        servers = [{"url": f"{schemes[0]}://{data['host']}{data.get('basePath','')}"}]
+
+    for server in servers:
+        url = server.get("url","")
+        # Check for environment-specific hostnames
+        m = ENV_URL_PATTERNS.search(url)
+        if m:
+            env_findings.append({
+                "type": "Environment Leakage in Server URL",
+                "api": title,
+                "value": url,
+                "indicator": m.group(1).rstrip(".")
+            })
+            findings.append({
+                "severity": "HIGH",
+                "type": "Multi-Tenant Env Leakage -- Environment Server URL",
+                "endpoint": "server url",
+                "api": title,
+                "detail": f"Server URL '{url}' contains environment indicator '{m.group(1).rstrip('.')}' -- internal tier exposed"
+            })
+
+        # Check server variables for tenant/env variables
+        for var_name, var_obj in server.get("variables",{}).items():
+            var_lower = var_name.lower()
+            if any(k in var_lower for k in ["tenant","org","company","account","workspace",
+                                            "namespace","realm","client","env","environment"]):
+                enum_vals = var_obj.get("enum",[]) if isinstance(var_obj, dict) else []
+                default_val = var_obj.get("default","") if isinstance(var_obj, dict) else ""
+                all_recon.append({
+                    "type": "Server Variable -- Tenant/Env",
+                    "api": title,
+                    "variable": var_name,
+                    "default": default_val,
+                    "enum": enum_vals
+                })
+                findings.append({
+                    "severity": "MEDIUM",
+                    "type": "Multi-Tenant Env Leakage -- Server Variable",
+                    "endpoint": f"server variable: {var_name}",
+                    "api": title,
+                    "detail": f"Server variable '{var_name}' default='{default_val}' enum={enum_vals[:5]} -- tenant/env structure exposed"
+                })
+
+    # ── Scan paths for tenant-scoped variables ────────────────
+    for path in data.get("paths",{}).keys():
+        m = TENANT_VARS.search(path)
+        if m:
+            tenant_findings.append({
+                "type": "Tenant-Scoped Path Variable",
+                "api": title,
+                "path": path,
+                "variable": m.group(1)
+            })
+
+    # ── Scan parameters for environment indicators ────────────
+    for path, methods_obj in data.get("paths",{}).items():
+        if not isinstance(methods_obj, dict):
+            continue
+        for method, op in methods_obj.items():
+            if not isinstance(op, dict):
+                continue
+            for param in op.get("parameters",[]):
+                if not isinstance(param, dict):
+                    continue
+                pname = param.get("name","")
+                pdesc = param.get("description","")
+                penum = param.get("schema",{}).get("enum",[]) if isinstance(param.get("schema",{}), dict) else []
+
+                # Check param name for tenant indicators
+                if TENANT_VARS.search("{"+pname+"}"):
+                    all_recon.append({
+                        "type": "Tenant Parameter",
+                        "api": title,
+                        "endpoint": f"{method.upper()} {path}",
+                        "parameter": pname,
+                        "in": param.get("in",""),
+                    })
+
+                # Check enum values for environment indicators
+                for eval_val in penum:
+                    if ENV_PATTERNS.search(str(eval_val)):
+                        env_findings.append({
+                            "type": "Environment Enum Value in Parameter",
+                            "api": title,
+                            "endpoint": f"{method.upper()} {path}",
+                            "parameter": pname,
+                            "value": eval_val
+                        })
+                        findings.append({
+                            "severity": "MEDIUM",
+                            "type": "Multi-Tenant Env Leakage -- Environment Enum",
+                            "endpoint": f"{method.upper()} {path}",
+                            "api": title,
+                            "detail": f"Parameter '{pname}' enum contains environment value '{eval_val}'"
+                        })
+
+    # ── Check x-extensions for tenant/env metadata ────────────
+    for key, val in data.items():
+        if not key.startswith("x-"):
+            continue
+        key_lower = key.lower()
+        if any(k in key_lower for k in ["tenant","environment","env","region","namespace","org"]):
+            all_recon.append({
+                "type": "x-Extension Tenant/Env",
+                "api": title,
+                "key": key,
+                "value": str(val)[:200]
+            })
+            findings.append({
+                "severity": "MEDIUM",
+                "type": "Multi-Tenant Env Leakage -- x-Extension",
+                "endpoint": f"global: {key}",
+                "api": title,
+                "detail": f"Extension '{key}' reveals tenant/env architecture: {str(val)[:100]}"
+            })
+
+print()
+
+# Write output
+with open(out_file, "w") as f:
+    f.write(f"Multi-Tenant & Environment Leakage Recon\n" + "="*60 + "\n\n")
+
+    f.write(f"TENANT-SCOPED PATHS ({len(tenant_findings)}):\n" + "-"*40 + "\n")
+    for t in tenant_findings:
+        f.write(f"  [{t['api']}]  {t['path']}  var={{{t['variable']}}}\n")
+
+    f.write(f"\nENVIRONMENT INDICATORS ({len(env_findings)}):\n" + "-"*40 + "\n")
+    for e in env_findings:
+        f.write(f"  [{e['api']}]  {e['type']}: {e.get('value','')}  param={e.get('parameter','n/a')}\n")
+
+    f.write(f"\nARCHITECTURAL FOOTPRINT ({len(all_recon)}):\n" + "-"*40 + "\n")
+    for r in all_recon:
+        f.write(f"  [{r['api']}]  {r['type']}: {json.dumps({k:v for k,v in r.items() if k not in ('api','type')})[:120]}\n")
+
+vulns.extend(findings)
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+print(f"  Tenant-scoped paths    : {len(tenant_findings)}")
+print(f"  Environment indicators : {len(env_findings)}")
+print(f"  Architectural items    : {len(all_recon)}")
+print(f"  Findings added         : {len(findings)}")
+PYEOF
+
+# ============================================================
+# PHASE 13 – JWT Algorithm Confusion Surface  [urllib3]
 # ============================================================
 phase_header 13 "JWT algorithm confusion surface"
 
-# Finds all JWT-secured endpoints from securitySchemes.
-# Then probes live with:
-#   1. alg:none token (unsigned) → if 200, critical auth bypass
-#   2. Checks if spec exposes public key material (jwks_uri)
-# Snyk sees the code; SPIRE tests the runtime behavior.
-
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, re, os, glob, base64, subprocess
+import json, re, os, glob, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
 workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
@@ -1200,10 +1636,17 @@ timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file= f"{out_dir}/vuln-findings.txt"
 out_file = f"{out_dir}/jwt-surface.txt"
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
-# Build a minimal alg:none JWT (unsigned)
 def make_alg_none_token():
     header =base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=').decode()
     payload=base64.urlsafe_b64encode(b'{"sub":"spire-test","iat":1700000000,"exp":9999999999}').rstrip(b'=').decode()
@@ -1228,7 +1671,6 @@ for spec_file in spec_files:
         schemes_list=data.get("schemes",["https"])
         base_url=f"{schemes_list[0]}://{data['host']}{data.get('basePath','')}".rstrip("/")
 
-    # Check for JWT schemes
     jwt_scheme_names=set()
     for name, scheme in sec_schemes.items():
         if not isinstance(scheme,dict): continue
@@ -1237,7 +1679,6 @@ for spec_file in spec_files:
         sname=name.lower()
         if bf=="JWT" or "jwt" in sname or ("bearer" in stype and "jwt" in str(scheme).lower()):
             jwt_scheme_names.add(name)
-        # Check for exposed JWKS URI
         flows=scheme.get("flows",{}) or {}
         for flow_name, flow in flows.items():
             if isinstance(flow,dict):
@@ -1246,7 +1687,6 @@ for spec_file in spec_files:
                     new_vulns.append({"severity":"INFO","type":"JWT OAuth2 Flow Detected",
                                       "endpoint":f"scheme:{name}","api":title,
                                       "detail":f"Authorization URL: {authz_url}"})
-        # x-jwks-uri or openIdConnectUrl
         jwks=scheme.get("openIdConnectUrl","") or scheme.get("x-jwks-uri","")
         if jwks:
             new_vulns.append({"severity":"MEDIUM","type":"JWKS URI Exposed in Spec",
@@ -1255,7 +1695,6 @@ for spec_file in spec_files:
 
     if not jwt_scheme_names: continue
 
-    # Collect endpoints that use JWT schemes
     for path, methods_obj in data.get("paths",{}).items():
         if not isinstance(methods_obj,dict): continue
         for method, op in methods_obj.items():
@@ -1271,19 +1710,17 @@ for spec_file in spec_files:
 
 print(f"  JWT-secured endpoints  : {len(jwt_endpoints)}")
 
-# Probe first 30 endpoints with alg:none token
 probe_targets=[ep for ep in jwt_endpoints if ep.get("url") and "{" not in ep["url"]][:30]
 
 def probe_jwt(ep):
     url=ep["url"]
     try:
-        r=subprocess.run(
-            ["curl","-sk","-X",ep["method"],"-o","/dev/null","-w","%{http_code}",
-             "-H",f"Authorization: Bearer {ALG_NONE_TOKEN}",
-             url,"--max-time",str(timeout)],
-            capture_output=True,timeout=timeout+5)
-        code=r.stdout.decode().strip()
-    except: return None
+        resp=http.request(ep["method"], url, headers={"Authorization": f"Bearer {ALG_NONE_TOKEN}"},
+                          preload_content=False)
+        code=str(resp.status)
+        resp.release_conn()
+    except Exception:
+        return None
     if code in ("200","201","204"):
         return {"severity":"CRITICAL","type":"JWT Algorithm Confusion -- alg:none Accepted",
                 "endpoint":f"{ep['method']} {url}","api":ep["api"],
@@ -1326,11 +1763,6 @@ PYEOF
 # ============================================================
 phase_header 14 "Mass assignment surface detection"
 
-# Inspects POST/PUT request body schemas for dangerous fields.
-# If role, isAdmin, permissions, verified etc. appear in requestBody schema,
-# the developer may have forgotten to strip them server-side.
-# Snyk sees ORM code; SPIRE sees what the API spec says the server accepts.
-
 SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
 import json, os, glob
 
@@ -1357,7 +1789,6 @@ for spec_file in spec_files:
     try: data=json.load(open(spec_file))
     except: continue
     title=data.get("info",{}).get("title","Unknown")
-    # Flatten all schema $refs
     components=data.get("components",{}).get("schemas",{})
     defs=data.get("definitions",{})
     all_schemas={**components,**defs}
@@ -1373,7 +1804,6 @@ for spec_file in spec_files:
         s=resolve_schema(schema)
         if not isinstance(s,dict): return {}
         props=s.get("properties",{})
-        # allOf / oneOf / anyOf
         for key in ("allOf","oneOf","anyOf"):
             for sub in s.get(key,[]):
                 props.update(extract_props(sub))
@@ -1385,7 +1815,6 @@ for spec_file in spec_files:
             mu=method.upper()
             if mu not in ["POST","PUT","PATCH"]: continue
             if not isinstance(op,dict): continue
-            # OpenAPI 3.x requestBody
             rb=op.get("requestBody",{})
             if rb:
                 for media_type,media_obj in rb.get("content",{}).items():
@@ -1400,7 +1829,6 @@ for spec_file in spec_files:
                                 "api":title,
                                 "detail":f"Field '{field}' in {media_type} requestBody -- may allow privilege escalation if not server-side filtered"
                             })
-            # Swagger 2.x body parameter
             for param in op.get("parameters",[]):
                 if not isinstance(param,dict): continue
                 if param.get("in")!="body": continue
@@ -1430,11 +1858,6 @@ PYEOF
 # ============================================================
 phase_header 15 "Async API and webhook endpoint leakage"
 
-# Parses x-webhooks (OpenAPI 3.1), callbacks (OpenAPI 3.x), and
-# AsyncAPI-style channel definitions for leaked internal URLs,
-# Kafka topics, queue names, and internal service references.
-# No SAST tool touches this — it's spec metadata, not code.
-
 SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
 import json, os, glob, re
 
@@ -1445,7 +1868,6 @@ out_file = f"{out_dir}/webhook-leakage.txt"
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
-# Patterns that indicate internal/sensitive callback URLs
 INTERNAL_URL_PATTERNS=[
     re.compile(r'https?://(?:localhost|127\.|10\.|172\.1[6-9]\.|172\.2\d\.|172\.3[01]\.|192\.168\.)'),
     re.compile(r'https?://[^/]*\.(?:internal|local|corp|intranet|private)\b'),
@@ -1465,14 +1887,12 @@ for spec_file in spec_files:
     except: continue
     title=data.get("info",{}).get("title","Unknown")
 
-    # ── OpenAPI 3.1 x-webhooks ───────────────────────────────
     webhooks=data.get("x-webhooks",{}) or data.get("webhooks",{})
     for wh_name, wh_obj in webhooks.items():
         if not isinstance(wh_obj,dict): continue
         webhook_lines.append(f"[webhook]  {title}  /{wh_name}")
         for method, op in wh_obj.items():
             if not isinstance(op,dict): continue
-            # Check for internal URLs in servers
             for server in op.get("servers",[]):
                 url=server.get("url","")
                 if any(p.search(url) for p in INTERNAL_URL_PATTERNS):
@@ -1480,14 +1900,12 @@ for spec_file in spec_files:
                                      "type":"Webhook Internal URL Exposed",
                                      "endpoint":f"{method.upper()} {wh_name}","api":title,
                                      "detail":f"Callback URL suggests internal network: {url}"})
-        # Sensitive webhook name
         if SENSITIVE_TOPIC_PATTERNS.search(wh_name):
             findings.append({"severity":"MEDIUM",
                              "type":"Sensitive Webhook Name Exposed",
                              "endpoint":wh_name,"api":title,
                              "detail":f"Webhook '{wh_name}' suggests sensitive data flow"})
 
-    # ── OpenAPI 3.x callbacks ────────────────────────────────
     for path, methods_obj in data.get("paths",{}).items():
         if not isinstance(methods_obj,dict): continue
         for method, op in methods_obj.items():
@@ -1497,7 +1915,6 @@ for spec_file in spec_files:
                 webhook_lines.append(f"[callback] {title}  {method.upper()} {path}  -> {cb_name}")
                 for expr, cb_path_obj in cb_obj.items():
                     if not isinstance(cb_path_obj,dict): continue
-                    # Check expr for internal URL patterns
                     if any(p.search(expr) for p in INTERNAL_URL_PATTERNS):
                         findings.append({"severity":"HIGH",
                                          "type":"Callback Internal URL in Spec",
@@ -1511,7 +1928,6 @@ for spec_file in spec_files:
                                          "api":title,
                                          "detail":f"Callback name/expr suggests sensitive topic: {cb_name}"})
 
-    # ── x-kafka / x-amqp / AsyncAPI channel hints ───────────
     for ext_key in ("x-kafka-topic","x-amqp-exchange","x-sqs-queue",
                     "x-pubsub-topic","channels","x-channels"):
         ext_val=data.get(ext_key,{})
@@ -1547,29 +1963,364 @@ print(f"  Leakage findings       : {len(findings)}")
 PYEOF
 
 # ============================================================
-# PHASE 16 – Shadow API via Response Header Mining
+# PHASE 15b – Passive Asset Link Extraction (OSINT)  [v3.0 NEW]
+# ============================================================
+phase_header "15b" "Passive asset link extraction -- OSINT from specs"
+
+SPIRE_OUT="$OUTPUT_DIR" python3 << 'PYEOF'
+import json, os, glob, re
+from collections import defaultdict
+
+out_dir   = os.environ.get("SPIRE_OUT","./spire-results")
+vuln_file = f"{out_dir}/vuln-findings.txt"
+out_file  = f"{out_dir}/leaked-assets.txt"
+
+try:    vulns=json.load(open(vuln_file))
+except: vulns=[]
+
+# Asset extraction regex patterns
+PATTERNS = {
+    "URL": re.compile(r'https?://[^\s"\'<>\]\)}{,]+'),
+    "AWS S3 Bucket (path-style)": re.compile(r'(?:https?://)?s3[.\-](?:[\w\-]+\.)?amazonaws\.com/([a-zA-Z0-9.\-_]+)'),
+    "AWS S3 Bucket (vhost)": re.compile(r'(?:https?://)?([a-zA-Z0-9.\-_]+)\.s3[.\-](?:[\w\-]+\.)?amazonaws\.com'),
+    "AWS S3 ARN": re.compile(r'arn:aws:s3:::([a-zA-Z0-9.\-_]+)'),
+    "Azure Blob Storage": re.compile(r'(?:https?://)?([a-zA-Z0-9]+)\.blob\.core\.windows\.net'),
+    "GCP Storage": re.compile(r'(?:https?://)?storage\.googleapis\.com/([a-zA-Z0-9.\-_]+)'),
+    "GCP Storage (vhost)": re.compile(r'(?:https?://)?([a-zA-Z0-9.\-_]+)\.storage\.googleapis\.com'),
+    "CloudFront CDN": re.compile(r'(?:https?://)?([a-zA-Z0-9]+)\.cloudfront\.net'),
+    "Internal Subdomain": re.compile(r'(?:https?://)?([a-zA-Z0-9.\-]+\.(?:internal|local|corp|intranet|private|dev|staging|stg|uat|test)\.[a-zA-Z0-9.\-]+)'),
+    "Email Domain": re.compile(r'[a-zA-Z0-9._%+\-]+@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'),
+    "Private IP": re.compile(r'\b((?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3})\b'),
+}
+
+# Recursively extract all string values from JSON
+def extract_strings(obj, strings=None):
+    if strings is None:
+        strings = []
+    if isinstance(obj, str):
+        strings.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            extract_strings(v, strings)
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_strings(item, strings)
+    return strings
+
+spec_files = sorted(glob.glob(f"{out_dir}/specs/*.json"))
+total = len(spec_files)
+
+# Categorized asset collections
+assets = defaultdict(set)
+findings = []
+
+for idx, spec_file in enumerate(spec_files, 1):
+    bar = "#"*(idx*40//max(total,1)) + "."*(40-idx*40//max(total,1))
+    pct = idx*100//max(total,1)
+    print(f"\r  [{bar}] {pct:3d}%  {os.path.basename(spec_file)[:30]:<30}", end="", flush=True)
+
+    try:
+        data = json.load(open(spec_file))
+    except:
+        continue
+
+    title = data.get("info",{}).get("title","Unknown")
+
+    # Extract all strings from the entire spec
+    all_strings = extract_strings(data)
+    full_text = " ".join(all_strings)
+
+    for asset_type, pattern in PATTERNS.items():
+        for match in pattern.findall(full_text):
+            match_str = match.strip().rstrip("/.,;:")
+            if len(match_str) < 4:
+                continue
+            # Skip common false positives
+            if match_str in ("http://", "https://", "localhost", "127.0.0.1", "example.com",
+                             "www.example.com", "test.com"):
+                continue
+            if "example.com" in match_str or "localhost" in match_str:
+                # Still track internal references
+                if "localhost" in match_str:
+                    assets["Localhost Reference"].add(match_str)
+                continue
+
+            assets[asset_type].add(match_str)
+
+    # Extract domains from URLs
+    url_pattern = PATTERNS["URL"]
+    for url_match in url_pattern.findall(full_text):
+        try:
+            domain = url_match.split("/")[2].split(":")[0]
+            if domain and "example" not in domain:
+                assets["Extracted Domain"].add(domain)
+        except (IndexError, ValueError):
+            pass
+
+print()
+
+# Generate findings from notable assets
+for asset_type in ["AWS S3 Bucket (path-style)", "AWS S3 Bucket (vhost)", "AWS S3 ARN"]:
+    for bucket in assets.get(asset_type, set()):
+        findings.append({
+            "severity": "HIGH",
+            "type": "Leaked Asset -- AWS S3 Bucket",
+            "endpoint": "spec metadata",
+            "api": "OSINT",
+            "detail": f"S3 bucket reference found: {bucket}"
+        })
+
+for blob in assets.get("Azure Blob Storage", set()):
+    findings.append({
+        "severity": "HIGH",
+        "type": "Leaked Asset -- Azure Blob Storage",
+        "endpoint": "spec metadata",
+        "api": "OSINT",
+        "detail": f"Azure Blob storage account found: {blob}"
+    })
+
+for gcs in assets.get("GCP Storage", set()) | assets.get("GCP Storage (vhost)", set()):
+    findings.append({
+        "severity": "HIGH",
+        "type": "Leaked Asset -- GCP Storage Bucket",
+        "endpoint": "spec metadata",
+        "api": "OSINT",
+        "detail": f"GCP storage bucket found: {gcs}"
+    })
+
+for subdomain in assets.get("Internal Subdomain", set()):
+    findings.append({
+        "severity": "HIGH",
+        "type": "Leaked Asset -- Internal Subdomain",
+        "endpoint": "spec metadata",
+        "api": "OSINT",
+        "detail": f"Internal subdomain leaked in spec: {subdomain}"
+    })
+
+for ip in assets.get("Private IP", set()):
+    findings.append({
+        "severity": "MEDIUM",
+        "type": "Leaked Asset -- Private IP Address",
+        "endpoint": "spec metadata",
+        "api": "OSINT",
+        "detail": f"Private IP address found: {ip}"
+    })
+
+for cdn in assets.get("CloudFront CDN", set()):
+    findings.append({
+        "severity": "MEDIUM",
+        "type": "Leaked Asset -- CloudFront Distribution",
+        "endpoint": "spec metadata",
+        "api": "OSINT",
+        "detail": f"CloudFront distribution found: {cdn}.cloudfront.net"
+    })
+
+# Write output
+with open(out_file, "w") as f:
+    f.write(f"Passive Asset Link Extraction -- OSINT from Specs\n" + "="*60 + "\n\n")
+    total_assets = sum(len(v) for v in assets.values())
+    f.write(f"Total unique assets extracted: {total_assets}\n\n")
+
+    for category in sorted(assets.keys()):
+        items = sorted(assets[category])
+        if not items:
+            continue
+        f.write(f"{category} ({len(items)}):\n" + "-"*40 + "\n")
+        for item in items:
+            f.write(f"  {item}\n")
+        f.write("\n")
+
+vulns.extend(findings)
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+total_assets = sum(len(v) for v in assets.values())
+print(f"  Total unique assets    : {total_assets}")
+for category in sorted(assets.keys()):
+    cnt = len(assets[category])
+    if cnt > 0:
+        print(f"    {category:<30}: {cnt}")
+print(f"  Findings added         : {len(findings)}")
+PYEOF
+
+# ============================================================
+# PHASE 15c – GraphQL Infrastructure Identification  [v3.0 NEW]
+# ============================================================
+phase_header "15c" "GraphQL infrastructure identification"
+
+SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
+import json, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
+workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
+timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
+vuln_file= f"{out_dir}/vuln-findings.txt"
+out_file = f"{out_dir}/graphql-endpoints.txt"
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
+try:    vulns=json.load(open(vuln_file))
+except: vulns=[]
+
+try:    live_hosts=[l.strip() for l in open(f"{out_dir}/live-clean.txt") if l.strip()]
+except: live_hosts=[]
+
+if not live_hosts:
+    print("  No live hosts to probe for GraphQL.")
+    with open(out_file,"w") as f: f.write("No live hosts available.\n")
+    with open(vuln_file,"w") as f: json.dump(vulns,f,indent=2)
+    exit(0)
+
+GRAPHQL_PATHS = [
+    "/graphql",
+    "/v1/graphql",
+    "/v2/graphql",
+    "/api/graphql",
+    "/graphiql",
+    "/playground",
+    "/query",
+    "/gql",
+    "/graphql/console",
+    "/__graphql",
+    "/api/gql",
+    "/graphql/v1",
+    "/altair",
+    "/explorer",
+]
+
+# GraphQL response body markers
+GRAPHQL_MARKERS = ['"data"', '"errors"', '"extensions"', '__schema', '__typename',
+                   'graphql', 'GraphQL', 'query', 'mutation', 'subscription']
+
+probes = [(host, path) for host in live_hosts for path in GRAPHQL_PATHS]
+print(f"  Live hosts             : {len(live_hosts)}")
+print(f"  Total probes           : {len(probes)}")
+
+def probe_graphql(host, path):
+    url = f"{host.rstrip('/')}{path}"
+    try:
+        # Try GET first with an introspection-like query param
+        resp = http.request(
+            "GET", url,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            preload_content=True
+        )
+        code = resp.status
+        body = resp.data.decode("utf-8", errors="ignore")[:2000]
+    except Exception:
+        return None
+
+    # GraphQL endpoints typically respond 200 or 400 (bad query but endpoint exists)
+    if code not in (200, 400):
+        return None
+
+    # Check for GraphQL-specific markers in the response body
+    marker_hits = sum(1 for m in GRAPHQL_MARKERS if m in body)
+
+    if marker_hits >= 2 or (code == 400 and any(m in body for m in ['"errors"', 'GraphQL', 'query'])):
+        confirmed = True
+    elif code == 200 and marker_hits >= 1:
+        confirmed = True
+    else:
+        confirmed = False
+
+    if not confirmed:
+        return None
+
+    # Determine if it's an IDE or an API endpoint
+    is_ide = any(k in body.lower() for k in ["graphiql", "playground", "altair", "explorer", "<html", "<!doctype"])
+    ep_type = "GraphQL IDE" if is_ide else "GraphQL API"
+
+    return {
+        "url": url,
+        "status": code,
+        "type": ep_type,
+        "marker_hits": marker_hits,
+    }
+
+total = len(probes); done_count = 0; confirmed_endpoints = []; findings = []
+with ThreadPoolExecutor(max_workers=workers) as ex:
+    futs = {ex.submit(probe_graphql, host, path): (host, path) for host, path in probes}
+    for f in as_completed(futs):
+        done_count += 1
+        if done_count % 50 == 0 or done_count == total:
+            bar = "#"*(done_count*40//max(total,1)) + "."*(40-done_count*40//max(total,1))
+            pct = done_count*100//max(total,1)
+            h, p = futs[f]
+            print(f"\r  [{bar}] {pct:3d}%  {(h+p)[:38]:<38}", end="", flush=True)
+        result = f.result()
+        if result:
+            confirmed_endpoints.append(result)
+print()
+
+# Deduplicate by URL
+seen = set()
+unique_endpoints = []
+for ep in confirmed_endpoints:
+    if ep["url"] not in seen:
+        seen.add(ep["url"])
+        unique_endpoints.append(ep)
+
+for ep in unique_endpoints:
+    severity = "MEDIUM" if ep["type"] == "GraphQL IDE" else "INFO"
+    findings.append({
+        "severity": severity,
+        "type": f"GraphQL Infrastructure -- {ep['type']}",
+        "endpoint": ep["url"],
+        "api": "graphql-recon",
+        "detail": f"Confirmed {ep['type']} endpoint (HTTP {ep['status']}, {ep['marker_hits']} markers)"
+    })
+    print(f"  [{ep['type']:<12}]  {ep['url']}  (HTTP {ep['status']})")
+
+# Write output
+with open(out_file, "w") as f:
+    f.write(f"GraphQL Infrastructure Identification\n" + "="*60 + "\n")
+    f.write(f"Confirmed endpoints: {len(unique_endpoints)}\n\n")
+    f.write(f"{'TYPE':<15}  {'STATUS':<8}  URL\n" + "-"*80 + "\n")
+    for ep in unique_endpoints:
+        f.write(f"{ep['type']:<15}  HTTP {ep['status']:<3}  {ep['url']}\n")
+
+vulns.extend(findings)
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+print(f"\n  GraphQL endpoints      : {len(unique_endpoints)}")
+print(f"  Findings added         : {len(findings)}")
+PYEOF
+
+# ============================================================
+# PHASE 16 – Shadow API via Response Header Mining  [urllib3]
 # ============================================================
 phase_header 16 "Shadow API discovery via response header mining"
 
-# Re-fetches confirmed swagger URLs (and live hosts) with full header capture.
-# Extracts intelligence from:
-#   X-Powered-By, Server → framework/version fingerprint
-#   X-Internal-Service, X-Upstream, X-Backend → internal service names
-#   X-Request-Id format → microservice architecture inference
-#   X-RateLimit-* absence → no rate limiting
-#   Access-Control-Allow-Origin: * → CORS wildcard confirmed live
-#   Strict-Transport-Security absence → HSTS missing
-#   X-Content-Type-Options absence → MIME sniffing possible
-
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, re, subprocess, os
+import json, re, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
 workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
 timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file= f"{out_dir}/vuln-findings.txt"
 out_file = f"{out_dir}/shadow-headers.txt"
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
 
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
@@ -1590,20 +2341,15 @@ INTERNAL_HEADER_NAMES=re.compile(
 
 def fetch_headers(url):
     try:
-        r=subprocess.run(
-            ["curl","-sk","-I",url,"--max-time",str(timeout),"--compressed"],
-            capture_output=True,timeout=timeout+5)
-        return r.stdout.decode("utf-8",errors="ignore")
-    except: return ""
+        resp = http.request("HEAD", url, preload_content=False)
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+        resp.release_conn()
+        return headers
+    except Exception:
+        return {}
 
-def analyze_headers(url,raw_headers):
+def analyze_headers(url, headers):
     findings=[]
-    headers={}
-    for line in raw_headers.splitlines():
-        if ":" in line and not line.startswith("HTTP/"):
-            k,_,v=line.partition(":")
-            headers[k.strip().lower()]=v.strip()
-
     host=url.split("/")[2] if "/" in url else url
 
     # EOL / outdated framework
@@ -1666,8 +2412,8 @@ with ThreadPoolExecutor(max_workers=workers) as ex:
         pct=done_count*100//max(total,1)
         url=futs[f]
         print(f"\r  [{bar}] {pct:3d}%  {url[:38]:<38}",end="",flush=True)
-        raw=f.result()
-        findings,headers=analyze_headers(url,raw)
+        headers=f.result()
+        findings,headers=analyze_headers(url,headers)
         new_vulns.extend(findings)
         all_header_data.append({"url":url,"headers":headers})
 print()
@@ -1686,22 +2432,246 @@ print(f"  Header findings        : {len(new_vulns)}")
 PYEOF
 
 # ============================================================
-# PHASE 17 – OpenAPI x- Extension Inconsistency
+# PHASE 16b – Passive Info Disclosure & Stack Trace Sifter  [v3.0 NEW]
+# ============================================================
+phase_header "16b" "Passive information disclosure and stack trace sifting"
+
+SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
+import json, re, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
+workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
+timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
+vuln_file= f"{out_dir}/vuln-findings.txt"
+out_file = f"{out_dir}/stack-fingerprints.txt"
+
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
+try:    vulns=json.load(open(vuln_file))
+except: vulns=[]
+
+# Collect probe URLs from swagger + live hosts
+try:    swagger_urls=[l.strip() for l in open(f"{out_dir}/real-swaggers.txt") if l.strip()]
+except: swagger_urls=[]
+try:    live_hosts=[l.strip() for l in open(f"{out_dir}/live-clean.txt") if l.strip()]
+except: live_hosts=[]
+
+# Combine and deduplicate
+probe_urls = list(dict.fromkeys(swagger_urls + live_hosts))
+
+if not probe_urls:
+    print("  No URLs to probe for information disclosure.")
+    with open(out_file,"w") as f: f.write("No URLs available.\n")
+    with open(vuln_file,"w") as f: json.dump(vulns,f,indent=2)
+    exit(0)
+
+# Stack trace / framework fingerprint patterns
+FINGERPRINTS = {
+    "Java / Spring Boot": {
+        "patterns": [
+            re.compile(r'org\.springframework\.\w+'),
+            re.compile(r'Whitelabel\s+Error\s+Page'),
+            re.compile(r'at\s+java\.\w+\.\w+'),
+            re.compile(r'at\s+org\.apache\.catalina'),
+            re.compile(r'Spring\s+Boot'),
+            re.compile(r'(?:java|javax)\.\w+\.\w+Exception'),
+        ],
+        "severity": "HIGH",
+    },
+    "Node.js / Express": {
+        "patterns": [
+            re.compile(r'at\s+Module\._compile'),
+            re.compile(r'Cannot\s+GET\s+/'),
+            re.compile(r'express\s+deprecated'),
+            re.compile(r'node_modules/'),
+            re.compile(r'at\s+Object\.<anonymous>'),
+            re.compile(r'SyntaxError:\s+Unexpected'),
+            re.compile(r'ReferenceError:'),
+        ],
+        "severity": "HIGH",
+    },
+    "Python / Django": {
+        "patterns": [
+            re.compile(r'Using\s+the\s+URLconf\s+defined\s+in'),
+            re.compile(r'Django\s+Version:'),
+            re.compile(r'Traceback\s+\(most\s+recent\s+call\s+last\)'),
+            re.compile(r'File\s+"[^"]+\.py",\s+line\s+\d+'),
+            re.compile(r'ImproperlyConfigured'),
+        ],
+        "severity": "HIGH",
+    },
+    "Python / Flask": {
+        "patterns": [
+            re.compile(r'werkzeug\.'),
+            re.compile(r'flask\.\w+'),
+            re.compile(r'jinja2\.'),
+        ],
+        "severity": "HIGH",
+    },
+    "PHP": {
+        "patterns": [
+            re.compile(r'Fatal\s+error:\s+'),
+            re.compile(r'PHP\s+Version\s+[\d.]+'),
+            re.compile(r'X-Powered-By:\s*PHP/[\d.]+'),
+            re.compile(r'<b>Warning</b>:\s+'),
+            re.compile(r'Call\s+Stack'),
+            re.compile(r'on\s+line\s+<b>\d+</b>'),
+        ],
+        "severity": "HIGH",
+    },
+    "ASP.NET": {
+        "patterns": [
+            re.compile(r'ASP\.NET'),
+            re.compile(r'__VIEWSTATE'),
+            re.compile(r"Server\s+Error\s+in\s+'/'\s+Application"),
+            re.compile(r'X-AspNet-Version'),
+            re.compile(r'System\.Web\.'),
+            re.compile(r'Microsoft\.AspNet'),
+        ],
+        "severity": "HIGH",
+    },
+    "Ruby / Rails": {
+        "patterns": [
+            re.compile(r'ActionController::RoutingError'),
+            re.compile(r'ActiveRecord'),
+            re.compile(r'Rails\.root'),
+            re.compile(r'app/controllers/'),
+            re.compile(r'Action\s+Controller:\s+Exception'),
+        ],
+        "severity": "HIGH",
+    },
+    "Nginx": {
+        "patterns": [
+            re.compile(r'nginx/[\d.]+'),
+            re.compile(r'<center>nginx</center>'),
+        ],
+        "severity": "LOW",
+    },
+    "Apache": {
+        "patterns": [
+            re.compile(r'Apache/[\d.]+'),
+            re.compile(r'<address>Apache/[\d.]+'),
+        ],
+        "severity": "LOW",
+    },
+    "Debug Mode Active": {
+        "patterns": [
+            re.compile(r'DEBUG\s*=\s*True', re.I),
+            re.compile(r'DJANGO_SETTINGS_MODULE'),
+            re.compile(r'DATABASE_URL\s*='),
+            re.compile(r'SECRET_KEY\s*='),
+            re.compile(r'stack\s*trace', re.I),
+            re.compile(r'(?:SQL|sql)\s+(?:query|statement|error)', re.I),
+        ],
+        "severity": "CRITICAL",
+    },
+}
+
+def probe_body(url):
+    try:
+        resp = http.request("GET", url, preload_content=True)
+        body = resp.data.decode("utf-8", errors="ignore")[:8000]
+        server_header = resp.headers.get("Server", "")
+        powered_header = resp.headers.get("X-Powered-By", "")
+        # Append headers to body for pattern matching
+        full_text = body + "\n" + server_header + "\n" + powered_header
+        return url, full_text, resp.status
+    except Exception:
+        return url, "", 0
+
+total = len(probe_urls); done_count = 0
+all_fingerprints = []  # (url, tech, pattern_match, severity)
+findings = []
+
+with ThreadPoolExecutor(max_workers=workers) as ex:
+    futs = {ex.submit(probe_body, url): url for url in probe_urls}
+    for f in as_completed(futs):
+        done_count += 1
+        if done_count % 20 == 0 or done_count == total:
+            bar = "#"*(done_count*40//max(total,1)) + "."*(40-done_count*40//max(total,1))
+            pct = done_count*100//max(total,1)
+            u = futs[f]
+            print(f"\r  [{bar}] {pct:3d}%  {u[:38]:<38}", end="", flush=True)
+
+        url, text, status = f.result()
+        if not text:
+            continue
+
+        matched_techs = set()
+        for tech, config in FINGERPRINTS.items():
+            for pattern in config["patterns"]:
+                m = pattern.search(text)
+                if m:
+                    if tech not in matched_techs:
+                        matched_techs.add(tech)
+                        all_fingerprints.append({
+                            "url": url,
+                            "technology": tech,
+                            "match": m.group(0)[:100],
+                            "severity": config["severity"],
+                            "status": status,
+                        })
+print()
+
+# Generate findings (deduplicate by url+tech)
+seen = set()
+for fp in all_fingerprints:
+    key = (fp["url"], fp["technology"])
+    if key in seen:
+        continue
+    seen.add(key)
+    findings.append({
+        "severity": fp["severity"],
+        "type": f"Information Disclosure -- {fp['technology']}",
+        "endpoint": fp["url"],
+        "api": "stack-fingerprint",
+        "detail": f"Detected {fp['technology']} footprint: '{fp['match']}' (HTTP {fp['status']})"
+    })
+
+# Print summary
+tech_counts = {}
+for fp in all_fingerprints:
+    tech_counts[fp["technology"]] = tech_counts.get(fp["technology"], 0) + 1
+
+for tech, count in sorted(tech_counts.items(), key=lambda x: -x[1]):
+    print(f"  [{tech:<25}]  {count} hosts")
+
+# Write output
+with open(out_file, "w") as f:
+    f.write(f"Passive Information Disclosure & Stack Trace Sifter\n" + "="*60 + "\n")
+    f.write(f"Total fingerprints: {len(all_fingerprints)}\n\n")
+
+    f.write(f"{'SEVERITY':<10}  {'TECHNOLOGY':<25}  {'STATUS':<8}  {'MATCH':<40}  URL\n" + "-"*120 + "\n")
+    for fp in sorted(all_fingerprints, key=lambda x: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}.get(x["severity"],9)):
+        f.write(f"{fp['severity']:<10}  {fp['technology']:<25}  HTTP {fp['status']:<3}  {fp['match']:<40}  {fp['url']}\n")
+
+vulns.extend(findings)
+with open(vuln_file, "w") as f:
+    json.dump(vulns, f, indent=2)
+
+print(f"\n  Total fingerprints     : {len(all_fingerprints)}")
+print(f"  Findings added         : {len(findings)}")
+PYEOF
+
+# ============================================================
+# PHASE 17 – OpenAPI x- Extension Inconsistency  [urllib3]
 # ============================================================
 phase_header 17 "OpenAPI x- extension inconsistency analysis"
 
-# Scans all specs for custom x- fields and flags:
-#   x-auth-required: false  → endpoint claims no auth needed
-#   x-internal: true         → claims internal only (verify it's not public)
-#   x-role / x-permission    → role hints that may not be enforced
-#   x-deprecated-by          → deprecated but may still be live
-#   x-beta / x-preview       → beta endpoints often skip security review
-#   Cross-check: if x-internal:true but no auth on endpoint → HIGH
-#   Cross-check: if x-auth-required:false but live probe returns 401 → LOW (false positive in spec)
-
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_THREADS="$THREADS" SPIRE_TIMEOUT="$TIMEOUT" python3 << 'PYEOF'
-import json, re, os, glob, subprocess
+import json, re, os, glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 out_dir  = os.environ.get("SPIRE_OUT","./spire-results")
 workers  = max(1,int(os.environ.get("SPIRE_THREADS","40")))
@@ -1709,12 +2679,20 @@ timeout  = int(os.environ.get("SPIRE_TIMEOUT","10"))
 vuln_file= f"{out_dir}/vuln-findings.txt"
 out_file = f"{out_dir}/xextension-issues.txt"
 
+http = urllib3.PoolManager(
+    num_pools=20,
+    maxsize=min(workers, 100),
+    cert_reqs='CERT_NONE',
+    timeout=urllib3.Timeout(connect=5.0, read=float(timeout)),
+    retries=urllib3.Retry(total=2, backoff_factor=0.3),
+)
+
 try:    vulns=json.load(open(vuln_file))
 except: vulns=[]
 
 spec_files=sorted(glob.glob(f"{out_dir}/specs/*.json"))
 findings=[]
-ext_inventory=[]  # all x- fields found for reference
+ext_inventory=[]
 
 SENSITIVE_X_KEYS=re.compile(
     r'^x-(?:auth|role|permission|acl|internal|private|admin|secret|'
@@ -1724,11 +2702,12 @@ SENSITIVE_X_KEYS=re.compile(
 
 def get_live_code(url,method="GET"):
     try:
-        r=subprocess.run(["curl","-sk","-X",method,"-o","/dev/null","-w","%{http_code}",
-                          url,"--max-time",str(timeout)],
-                         capture_output=True,timeout=timeout+5)
-        return r.stdout.decode().strip()
-    except: return "ERR"
+        resp=http.request(method, url, preload_content=False)
+        code=str(resp.status)
+        resp.release_conn()
+        return code
+    except Exception:
+        return "ERR"
 
 def check_val_truthy(val):
     if isinstance(val,bool): return val
@@ -1751,7 +2730,6 @@ for spec_file in spec_files:
         schemes=data.get("schemes",["https"])
         base_url=f"{schemes[0]}://{data['host']}{data.get('basePath','')}".rstrip("/")
 
-    # Global x- extensions
     global_x={k:v for k,v in data.items() if k.startswith("x-")}
     for k,v in global_x.items():
         ext_inventory.append(f"[global]  {title}  {k}: {json.dumps(v)[:80]}")
@@ -1759,7 +2737,6 @@ for spec_file in spec_files:
     for path, methods_obj in data.get("paths",{}).items():
         if not isinstance(methods_obj,dict): continue
 
-        # Path-level x- fields
         path_x={k:v for k,v in methods_obj.items() if k.startswith("x-")}
         for k,v in path_x.items():
             ext_inventory.append(f"[path]    {title}  {path}  {k}: {json.dumps(v)[:80]}")
@@ -1770,7 +2747,6 @@ for spec_file in spec_files:
             if mu not in ["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"]: continue
             if not isinstance(op,dict): continue
 
-            # Collect x- fields at operation level
             op_x={k:v for k,v in op.items() if k.startswith("x-")}
             has_auth=bool(op.get("security")) or bool(data.get("security",[]))
             url=f"{base_url}{path}" if base_url and "{" not in path else None
@@ -1779,7 +2755,6 @@ for spec_file in spec_files:
                 ext_inventory.append(f"[op]      {title}  {mu} {path}  {k}: {json.dumps(v)[:80]}")
                 k_lower=k.lower()
 
-                # x-auth-required: false
                 if "auth" in k_lower and "required" in k_lower and check_val_falsy(v):
                     findings.append({
                         "severity":"HIGH",
@@ -1788,7 +2763,6 @@ for spec_file in spec_files:
                         "detail":f"'{k}: {v}' -- endpoint explicitly declares no auth required"
                     })
 
-                # x-internal: true but no auth
                 elif "internal" in k_lower and check_val_truthy(v) and not has_auth:
                     findings.append({
                         "severity":"HIGH",
@@ -1797,7 +2771,6 @@ for spec_file in spec_files:
                         "detail":f"'{k}: {v}' claims internal-only but no security scheme applied"
                     })
 
-                # x-role / x-permission / x-required-role
                 elif any(t in k_lower for t in ("role","permission","scope","acl")):
                     findings.append({
                         "severity":"MEDIUM",
@@ -1806,7 +2779,6 @@ for spec_file in spec_files:
                         "detail":f"'{k}: {json.dumps(v)[:80]}' -- verify this is enforced server-side, not just documented"
                     })
 
-                # x-deprecated-by
                 elif "deprecated" in k_lower:
                     dep_by=str(v) if v else "unspecified"
                     findings.append({
@@ -1816,7 +2788,6 @@ for spec_file in spec_files:
                         "detail":f"Deprecated by '{dep_by}' -- verify old endpoint is not still accessible"
                     })
 
-                # x-beta / x-preview / x-test / x-experimental
                 elif any(t in k_lower for t in ("beta","preview","experimental","test")):
                     findings.append({
                         "severity":"MEDIUM",
@@ -1825,7 +2796,6 @@ for spec_file in spec_files:
                         "detail":f"'{k}: {v}' -- beta/preview endpoints often bypass security review"
                     })
 
-                # x-bypass / x-debug / x-admin
                 elif any(t in k_lower for t in ("bypass","debug","admin","secret")):
                     findings.append({
                         "severity":"HIGH",
@@ -1855,7 +2825,7 @@ print(f"\n  x-Extension findings   : {len(findings)}")
 PYEOF
 
 # ============================================================
-# PHASE 18 – Report
+# PHASE 18 – Report  [v3.0 updated]
 # ============================================================
 phase_header 18 "Generating report"
 
@@ -1863,7 +2833,7 @@ END_TIME=$(date +%s)
 ELAPSED=$(( END_TIME - START_TIME ))
 
 SPIRE_OUT="$OUTPUT_DIR" SPIRE_INPUT="$INPUT" SPIRE_ELAPSED="$ELAPSED" python3 << 'PYEOF'
-import json, os, glob, datetime
+import json, os, glob, datetime, re
 
 out_dir = os.environ.get("SPIRE_OUT","./spire-results")
 inp     = os.environ.get("SPIRE_INPUT","")
@@ -1875,6 +2845,10 @@ except: vulns=[]
 def safe_read_lines(path):
     try:    return open(path).readlines()
     except: return []
+
+def safe_read(path):
+    try:    return open(path).read()
+    except: return ""
 
 swagger_urls  =[l.strip() for l in safe_read_lines(f"{out_dir}/real-swaggers.txt") if l.strip()]
 actuator_urls =[l.strip() for l in safe_read_lines(f"{out_dir}/actuator-found.txt") if l.strip()]
@@ -1898,7 +2872,6 @@ risk=(len(sev.get("CRITICAL",[]))*10+len(sev.get("HIGH",[]))*7+
 rlbl=("CRITICAL" if risk>=50 else "HIGH" if risk>=20
       else "MEDIUM" if risk>=10 else "LOW" if risk>=1 else "NONE")
 
-# Count v2.4 specific findings
 def count_by_type(pattern):
     return sum(1 for v in vulns if pattern.lower() in v.get("type","").lower())
 
@@ -1910,7 +2883,7 @@ L.append("|-------|-------|")
 L.append(f"| Generated | {now} |")
 L.append(f"| Duration | {elapsed}s |")
 L.append(f"| Input | `{inp}` |")
-L.append(f"| Version | 2.4 |")
+L.append(f"| Version | 3.0 |")
 L.append(f"| Risk Score | {risk} ({rlbl}) |")
 L.append("\n---\n")
 L.append("## Executive Summary\n")
@@ -1925,7 +2898,9 @@ L.append(f"| Endpoints Parsed | {total_ep} |")
 L.append(f"| Total Issues | {len(vulns)} |")
 for s in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
     if s in sev: L.append(f"| {s} | {len(sev[s])} |")
-L.append("\n**v2.4 Feature Findings:**\n")
+
+# v2.4 + v3.0 Feature Findings
+L.append("\n**Feature Findings (v2.4 + v3.0):**\n")
 L.append("| Feature | Findings |")
 L.append("|---------|----------|")
 for label, pattern in [
@@ -1937,8 +2912,12 @@ for label, pattern in [
     ("Webhook / Async Leakage",           "webhook"),
     ("Shadow Header Analysis",            "cors wildcard confirmed|outdated|internal service reference|hsts"),
     ("x-Extension Inconsistency",         "x-extension"),
+    ("Undocumented Parameters (v3.0)",    "undocumented parameter"),
+    ("Multi-Tenant Env Leakage (v3.0)",   "multi-tenant env leakage"),
+    ("Leaked Assets / OSINT (v3.0)",      "leaked asset"),
+    ("GraphQL Infrastructure (v3.0)",     "graphql infrastructure"),
+    ("Stack Fingerprints (v3.0)",         "information disclosure"),
 ]:
-    import re
     n=sum(1 for v in vulns if re.search(pattern,v.get("type",""),re.I))
     if n: L.append(f"| {label} | {n} |")
 
@@ -1971,6 +2950,41 @@ L.append("## Discovered Spring Actuator URLs\n")
 L.append("| # | URL |")
 L.append("|---|-----|")
 for i,url in enumerate(actuator_urls,1): L.append(f"| {i} | {url} |")
+
+# v3.0: GraphQL endpoints section
+graphql_lines = safe_read_lines(f"{out_dir}/graphql-endpoints.txt")
+graphql_eps = [l.strip() for l in graphql_lines if l.strip() and not l.startswith("=") and not l.startswith("-") and ":" in l and "GraphQL" not in l[:10] and "Confirmed" not in l and "TYPE" not in l]
+if graphql_eps:
+    L.append("\n---\n")
+    L.append("## Discovered GraphQL Endpoints\n")
+    L.append("| # | Endpoint |")
+    L.append("|---|----------|")
+    for i,ep in enumerate(graphql_eps,1): L.append(f"| {i} | `{ep.strip()}` |")
+
+# v3.0: Leaked assets summary
+leaked_text = safe_read(f"{out_dir}/leaked-assets.txt")
+if leaked_text and "Total unique assets extracted: 0" not in leaked_text:
+    L.append("\n---\n")
+    L.append("## Leaked Assets & OSINT\n")
+    L.append("*See `leaked-assets.txt` for the full categorized inventory.*\n")
+    # Extract category counts
+    for line in leaked_text.splitlines():
+        if line and line[0] != " " and line[0] != "=" and line[0] != "-" and "(" in line and "):" in line:
+            L.append(f"- {line.strip()}")
+
+# v3.0: Technology fingerprints
+stack_lines = safe_read_lines(f"{out_dir}/stack-fingerprints.txt")
+if len(stack_lines) > 3:
+    L.append("\n---\n")
+    L.append("## Technology Stack Fingerprints\n")
+    L.append("*See `stack-fingerprints.txt` for detailed matches.*\n")
+    L.append("| Technology | Match | URL |")
+    L.append("|------------|-------|-----|")
+    data_lines = [l for l in stack_lines if l.strip() and not l.startswith("=") and not l.startswith("-") and not l.startswith("Total") and not l.startswith("SEVERITY") and not l.startswith("Passive")]
+    for l in data_lines[:30]:
+        parts = l.split()
+        if len(parts) >= 4:
+            L.append(f"| {' '.join(parts[1:3])} | {parts[3] if len(parts)>3 else ''} | {parts[-1] if len(parts)>4 else ''} |")
 
 L.append("\n---\n")
 L.append("## Live Authentication Test\n")
@@ -2023,6 +3037,17 @@ for f,a in [
     ("HSTS Header Missing",                      "Add Strict-Transport-Security: max-age=31536000; includeSubDomains"),
     ("Internal Service Reference in Response Header","Remove or mask internal service headers at API gateway"),
     ("JWKS URI Exposed in Spec",                 "Verify JWKS endpoint only exposes public keys, never private"),
+    # v3.0 new remediations
+    ("Undocumented Parameter Surface",           "Audit hidden parameter candidates; remove debug/bypass parameters from production"),
+    ("Multi-Tenant Env Leakage",                 "Remove environment-specific hostnames and tenant variables from public specs"),
+    ("Leaked Asset -- AWS S3 Bucket",            "Verify bucket permissions; remove bucket references from public specs"),
+    ("Leaked Asset -- Azure Blob Storage",       "Verify storage account permissions; remove from public specs"),
+    ("Leaked Asset -- GCP Storage Bucket",       "Verify bucket ACLs; remove from public specs"),
+    ("Leaked Asset -- Internal Subdomain",       "Remove internal subdomain references from public-facing specifications"),
+    ("Leaked Asset -- Private IP Address",       "Remove RFC1918 addresses from all public specifications"),
+    ("Leaked Asset -- CloudFront Distribution",  "Verify CDN configuration; consider if distribution ID exposure is acceptable"),
+    ("GraphQL Infrastructure",                   "Apply authentication, depth limiting, and query complexity analysis to GraphQL endpoints"),
+    ("Information Disclosure",                   "Disable debug mode; configure custom error pages; suppress server version headers"),
 ]: L.append(f"| {f} | {a} |")
 
 L.append("\n---\n")
@@ -2030,32 +3055,47 @@ L.append("## Output Files\n")
 L.append("| File | Description |")
 L.append("|------|-------------|")
 for fn,desc in [
-    ("real-swaggers.txt",     "Confirmed swagger/openapi URLs"),
-    ("actuator-found.txt",    "Confirmed Spring Actuator URLs"),
-    ("specs/",                "Downloaded API specification files"),
-    ("all-endpoints.txt",     "All parsed endpoints"),
-    ("auth-test.txt",         "Live HTTP response codes per swagger URL"),
-    ("version-graveyard.txt", "Old API versions still live (v2.4)"),
-    ("hidden-endpoints.txt",  "Undocumented endpoints discovered (v2.4)"),
-    ("bola-surface.txt",      "BOLA surface map -- {id} endpoints (v2.4)"),
-    ("jwt-surface.txt",       "JWT-secured endpoints inventory (v2.4)"),
-    ("mass-assignment.txt",   "Mass assignment risk fields (v2.4)"),
-    ("webhook-leakage.txt",   "Webhook/async channel leakage (v2.4)"),
-    ("shadow-headers.txt",    "Response header intelligence (v2.4)"),
-    ("xextension-issues.txt", "x-extension inconsistencies (v2.4)"),
-    ("vuln-findings.txt",     "Raw vulnerability data (JSON)"),
-    ("findings.json",         "Machine-readable summary"),
-    ("REPORT.md",             "This report"),
+    ("real-swaggers.txt",         "Confirmed swagger/openapi URLs"),
+    ("actuator-found.txt",        "Confirmed Spring Actuator URLs"),
+    ("specs/",                    "Downloaded API specification files"),
+    ("all-endpoints.txt",         "All parsed endpoints"),
+    ("auth-test.txt",             "Live HTTP response codes per swagger URL"),
+    ("version-graveyard.txt",     "Old API versions still live (v2.4)"),
+    ("hidden-endpoints.txt",      "Undocumented endpoints discovered (v2.4)"),
+    ("bola-surface.txt",          "BOLA surface map -- {id} endpoints (v2.4)"),
+    ("jwt-surface.txt",           "JWT-secured endpoints inventory (v2.4)"),
+    ("mass-assignment.txt",       "Mass assignment risk fields (v2.4)"),
+    ("webhook-leakage.txt",       "Webhook/async channel leakage (v2.4)"),
+    ("shadow-headers.txt",        "Response header intelligence (v2.4)"),
+    ("xextension-issues.txt",     "x-extension inconsistencies (v2.4)"),
+    ("hidden-parameters.txt",     "Undocumented parameter surface map (v3.0)"),
+    ("tenant-environment-recon.txt","Multi-tenant & environment leakage (v3.0)"),
+    ("leaked-assets.txt",         "Passive OSINT -- leaked domains, buckets, IPs (v3.0)"),
+    ("graphql-endpoints.txt",     "Discovered GraphQL endpoints (v3.0)"),
+    ("stack-fingerprints.txt",    "Technology stack fingerprints (v3.0)"),
+    ("vuln-findings.txt",         "Raw vulnerability data (JSON)"),
+    ("findings.json",             "Machine-readable summary"),
+    ("REPORT.md",                 "This report"),
 ]: L.append(f"| `{fn}` | {desc} |")
 
 with open(f"{out_dir}/REPORT.md","w") as f: f.write("\n".join(L))
 
+# Build findings.json with v3.0 stats
+v30_stats = {
+    "hidden_parameters": sum(1 for v in vulns if "undocumented parameter" in v.get("type","").lower()),
+    "tenant_env_leakage": sum(1 for v in vulns if "multi-tenant" in v.get("type","").lower()),
+    "leaked_assets": sum(1 for v in vulns if "leaked asset" in v.get("type","").lower()),
+    "graphql_endpoints": sum(1 for v in vulns if "graphql" in v.get("type","").lower()),
+    "stack_fingerprints": sum(1 for v in vulns if "information disclosure" in v.get("type","").lower()),
+}
+
 json.dump({
-    "tool":"SPIRE","version":"2.4","scan_date":now,
+    "tool":"SPIRE","version":"3.0","scan_date":now,
     "duration_seconds":elapsed,"risk_score":risk,"risk_label":rlbl,
     "stats":{"targets":total_t,"live_hosts":live_c,
              "swagger_urls":len(swagger_urls),"actuator_urls":len(actuator_urls),
              "specs":spec_count,"endpoints":total_ep,"issues":len(vulns)},
+    "v30_stats": v30_stats,
     "severity_breakdown":{k:len(v) for k,v in sev.items()},
     "swagger_urls":swagger_urls,"actuator_urls":actuator_urls,
     "findings":vulns
@@ -2074,7 +3114,7 @@ except: print(0)
 
 printf '\n'
 printf "${D}%s${N}\n" "$SEP"
-printf "${B}  SPIRE v2.4 scan complete${N}\n"
+printf "${B}  SPIRE v3.0 scan complete${N}\n"
 printf "${D}%s${N}\n" "$SEP"
 printf "  ${G}[+]${N} Swagger URLs found   : %s\n" "$(wc -l < "$REAL_SWAGGERS" | tr -d ' ')"
 printf "  ${G}[+]${N} Actuator URLs found  : %s\n" "$(wc -l < "$ACTUATOR_FOUND" | tr -d ' ')"

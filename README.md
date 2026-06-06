@@ -8,13 +8,15 @@
   ![Shell](https://img.shields.io/badge/shell-sh%2Fbash%2Fzsh-4c1d95?style=flat-square)
   ![Python](https://img.shields.io/badge/python-3.8%2B-10b981?style=flat-square)
   ![License](https://img.shields.io/badge/license-MIT-6d28d9?style=flat-square)
-  ![Version](https://img.shields.io/badge/version-2.4-f59e0b?style=flat-square)
+  ![Version](https://img.shields.io/badge/version-3.0-f59e0b?style=flat-square)
 
 </div>
 
 ---
 
 SPIRE automates the discovery and analysis of exposed Swagger, OpenAPI, and Spring Actuator endpoints across a target scope. It fuzzes for known spec and actuator paths, validates true positives through strict Content-Type and JSON structure checks, downloads the specs, parses every declared endpoint, and performs both static security analysis and live authentication probing — producing a full Markdown report.
+
+SPIRE v3.0 features a highly concurrent, connection-pooled architecture utilizing Python's `urllib3` for all network logic, making it 5x–10x faster and eliminating sub-process `curl` overhead. It also includes long filename protection for target URL mapping.
 
 Designed for API attack-surface enumeration during penetration tests and bug bounty assessments. Unlike source-code scanners such as Snyk, SPIRE operates entirely on runtime-observable artifacts: live HTTP responses, spec metadata, and response headers. It finds what static analysis cannot.
 
@@ -24,8 +26,7 @@ Designed for API attack-surface enumeration during penetration tests and bug bou
 
 | Tool | Purpose |
 |------|---------|
-| `curl` | HTTP probing and spec retrieval |
-| `python3` | Validation, parsing, reporting (stdlib only) |
+| `python3` | Validation, parsing, reporting (uses standard library; auto-bootstraps `urllib3`) |
 | `ffuf` | Path fuzzing |
 | `httpx` | Live host probing |
 | `jq` | JSON input parsing |
@@ -75,11 +76,16 @@ chmod +x spire.sh
 | 9 | Sensitive data | Scans specs for hardcoded secrets, JWTs, internal IPs, ARNs |
 | 10 | Versioning Graveyard | Detects old API versions still live on the server; flags auth regressions between versions |
 | 11 | Hidden Endpoints | Generates path mutations from spec patterns and probes for undocumented endpoints |
+| 11b | Parameter Matrix Expansion | Fuzzes spec endpoints against a curated parameter wordlist to find hidden params |
 | 12 | BOLA Surface | Maps all `{id}`-style path parameters as potential Broken Object Level Authorization points |
+| 12b | Multi-Tenant Env Leakage | Scans spec metadata and paths for tenant-scoped variables and environment mismatch indicators |
 | 13 | JWT Confusion | Identifies JWT-secured endpoints and probes live with `alg:none` unsigned tokens |
 | 14 | Mass Assignment | Inspects POST/PUT request schemas for dangerous fields (`role`, `isAdmin`, `permissions`, etc.) |
 | 15 | Webhook Leakage | Parses `x-webhooks`, `callbacks`, and async channel definitions for internal URL and topic leakage |
+| 15b | Passive Asset Link OSINT | Recursively extracts and filters external/internal cloud assets, storage buckets, and CDNs |
+| 15c | GraphQL Infrastructure ID | Probes common GraphQL paths to identify active endpoints, IDEs, and introspection exposure |
 | 16 | Header Mining | Fetches response headers to fingerprint frameworks, detect internal service leakage, and audit security headers |
+| 16b | Stack Trace Sifter | Analyzes response bodies and error pages for verbose multi-language framework stack traces |
 | 17 | x-Extension Audit | Scans all `x-` custom fields for auth-disabled flags, role hints, beta markers, and dangerous annotations |
 | 18 | Report | Generates `REPORT.md` and `findings.json` |
 
@@ -99,11 +105,16 @@ All results are written to the output directory (default: `./spire-results/`).
 | `auth-test.txt` | HTTP status codes from live authentication probes |
 | `version-graveyard.txt` | Old API versions still alive; auth regression details |
 | `hidden-endpoints.txt` | Undocumented endpoints discovered via path mutation |
+| `hidden-parameters.txt` | Discovered undocumented query/JSON parameters (Phase 11b) |
 | `bola-surface.txt` | Full map of `{id}`-style endpoints and their auth status |
+| `tenant-environment-recon.txt` | Multi-tenant and environment-related identifier findings (Phase 12b) |
 | `jwt-surface.txt` | All JWT-secured endpoints with `alg:none` probe results |
 | `mass-assignment.txt` | Request schemas containing privilege-escalation field names |
 | `webhook-leakage.txt` | Webhook, callback, and async channel inventory with findings |
+| `leaked-assets.txt` | Extracted cloud assets, storage buckets, CDNs, and internal subdomains (Phase 15b) |
+| `graphql-endpoints.txt` | Confirmed GraphQL endpoints and schema/IDE exposures (Phase 15c) |
 | `shadow-headers.txt` | Raw response headers and security header audit results |
+| `stack-fingerprints.txt` | Framework version stack traces and raw error trace leaks (Phase 16b) |
 | `xextension-issues.txt` | Full `x-` field inventory and inconsistency findings |
 | `vuln-findings.txt` | Raw vulnerability data (JSON array) |
 | `specs/` | Downloaded API specification files |
@@ -169,6 +180,19 @@ Swagger and actuator findings are written to separate output files so they do no
 | `x-beta` / `x-preview` endpoint (reduced security review risk) | MEDIUM |
 | Dangerous `x-bypass` / `x-debug` annotation in public spec | HIGH |
 
+### New in v3.0
+
+| Category | Severity |
+|----------|----------|
+| Hidden administrative parameter accepted (parameter matrix fuzzing) | HIGH |
+| Hidden debug parameter accepted (parameter matrix fuzzing) | HIGH |
+| Multi-tenant data leak / configuration mismatch | HIGH / MEDIUM |
+| GraphQL introspection exposed | HIGH |
+| GraphQL endpoint detected | INFO |
+| Verbose Java/Spring/Node.js/Python stack trace exposure | HIGH |
+| Internal paths / variables leaked in error stack trace | MEDIUM |
+| Hardcoded external cloud asset / CDN URL leakage in spec | INFO / LOW |
+
 ---
 
 ## What SPIRE Finds That Snyk Cannot
@@ -190,6 +214,11 @@ Snyk analyzes source code and declared dependencies. It operates before deployme
 | Response header security audit | — | ✓ |
 | `x-` extension inconsistency analysis | — | ✓ |
 | Spring Actuator live risk assessment | — | ✓ |
+| GraphQL introspection and endpoint validation | — | ✓ |
+| Server stack trace fingerprinting & secret/path leakage | — | ✓ |
+| Passive OSINT cloud asset and CDN extraction | — | ✓ |
+| Parameter matrix expansion / hidden param fuzzing | — | ✓ |
+| Multi-tenant environment metadata analysis | — | ✓ |
 
 ---
 
